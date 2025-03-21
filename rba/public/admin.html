@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>管理员后台</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="admin-container">
+        <h1>用户管理系统</h1>
+        <div class="user-list">
+            <table>
+                <thead>
+                    <tr>
+                        <th>用户名</th>
+                        <th>注册时间</th>
+                        <th>最后登录</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="userTable">
+                    <!-- 用户数据通过JavaScript动态加载 -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div id="historyModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>登录历史</h2>
+            <div id="historyContent"></div>
+        </div>
+    </div>
+
+    <script>
+        // 模态框处理
+        const modal = document.getElementById('historyModal');
+        const span = document.getElementsByClassName('close')[0];
+
+        span.onclick = () => modal.style.display = 'none';
+        window.onclick = (event) => {
+            if (event.target == modal) {
+                modal.style.display = 'none';
+            }
+        }
+
+        async function showUserHistory(userId) {
+            try {
+                const response = await fetch(`/admin/users/${userId}`);
+                const data = await response.json();
+                
+                const historyHTML = data.loginHistory.map(entry => `
+                    <div class="history-entry ${entry.success ? 'success' : 'failure'}">
+                        <div class="time">${new Date(entry.timestamp).toLocaleString()}</div>
+                        <div class="info">
+                            <span>IP: ${entry.ip}</span>
+                            <span>成功: ${entry.success ? '是' : '否'}</span>
+                            <span>浏览器: ${entry.userAgent}</span>
+                        </div>
+                    </div>
+                `).join('');
+
+                document.getElementById('historyContent').innerHTML = historyHTML;
+                modal.style.display = 'block';
+            } catch (error) {
+                console.error('获取登录历史失败:', error);
+                alert('无法获取登录历史');
+            }
+        }
+
+        // 获取用户数据
+        async function loadUsers() {
+            try {
+                const response = await fetch('/admin/users');
+                const users = await response.json();
+                const tbody = document.getElementById('userTable');
+                
+                tbody.innerHTML = users.map(user => `
+                    <tr>
+                        <td>${user.username}</td>
+                        <td>${new Date(user.createdAt).toLocaleString()}</td>
+                        <td>${user.lastLogin ? new Date(user.lastLogin).toLocaleString() : '从未登录'}</td>
+                        <td>
+                            <button class="delete-btn" data-id="${user.id}">删除</button>
+                            <button class="detail-btn" data-id="${user.id}">详情</button>
+                        </td>
+                    </tr>
+                `).join('');
+
+                // 添加删除事件监听
+                document.querySelectorAll('.delete-btn').forEach(btn => {
+                    btn.addEventListener('click', async () => {
+                        if(confirm('确定要删除该用户吗？')) {
+                            await fetch(`/admin/users/${btn.dataset.id}`, {
+                                method: 'DELETE'
+                            });
+                            loadUsers();
+                        }
+                    });
+                });
+
+                document.querySelectorAll('.detail-btn').forEach(btn => {
+                    btn.addEventListener('click', () => showUserHistory(btn.dataset.id));
+                });
+            } catch (error) {
+                console.error('加载用户数据失败:', error);
+            }
+        }
+
+        // 初始化加载
+        loadUsers();
+    </script>
+</body>
+</html>

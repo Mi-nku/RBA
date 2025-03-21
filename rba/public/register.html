@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>注册 - RBA</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="login-container">
+        <h1>用户注册</h1>
+        <form class="login-form" id="registerForm">
+            <div class="input-group">
+                <label for="username">用户名</label>
+                <input type="text" id="username" required>
+            </div>
+            <div class="input-group">
+                <label for="email">电子邮箱</label>
+                <input type="email" id="email" required>
+            </div>
+            <div class="input-group">
+                <label for="password">密码</label>
+                <input type="password" id="password" required>
+            </div>
+            <div class="input-group">
+                <label for="confirm-password">确认密码</label>
+                <input type="password" id="confirm-password" required>
+            </div>
+            <button type="submit">注册</button>
+            <div style="text-align: center; margin-top: 1rem;">
+                <a href="/login" style="color: var(--secondary-color); text-decoration: none;">已有账户？立即登录</a>
+            </div>
+        </form>
+    </div>
+    <script>
+        document.getElementById('registerForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const password = document.getElementById('password').value;
+            const confirmPassword = document.getElementById('confirm-password').value;
+            
+            if (password !== confirmPassword) {
+                alert('两次输入的密码不一致');
+                return;
+            }
+
+            const userData = {
+                username: document.getElementById('username').value,
+                email: document.getElementById('email').value,
+                password: password
+            };
+
+            try {
+                const response = await fetch('/register', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(userData)
+                });
+
+                const result = await response.json();
+                if (response.ok) {
+                    alert('注册成功！');
+                    window.location.href = '/login';
+                } else {
+                    alert(result.message || '注册失败');
+                }
+            } catch (error) {
+                console.error('注册错误:', error);
+                alert('网络请求失败');
+            }
+        });
+    </script>
+</body>
+</html>
