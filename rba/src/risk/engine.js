@@ -77,10 +77,19 @@ class RiskEngine {
         let geoData = null;
         let score = 1.0;
         const { globalHistory, userHistory } = await this._getHistories(userId);
+
+
+        // 新增调试日志头
+        console.debug(`[风险计算] 用户 ${userId} 开始风险评估`, {
+            globalLoginCount: globalHistory.loginCount,
+            userLoginCount: userHistory.loginCount
+        });
     
         // 遍历所有主特征
         for (const mainFeature of Object.keys(config.coefficients)) {
             const featureValue = this._parseFeature(mainFeature, features);
+
+            console.debug(`[特征处理] 主特征 ${mainFeature} 解析结果:`, JSON.stringify(featureValue));
     
             // ===================== 攻击者概率 p_A_given_xk =====================
             let pA = 1.0;
@@ -90,6 +99,14 @@ class RiskEngine {
                 // 子特征攻击概率判断
                 let subRisk;
                 switch (subFeature) {
+                    case 'asn':
+        subRisk = subValue === 'Local' ? 0.01 :  // ← 在此处添加
+            this.maliciousNetworks.includes(subValue) ? 0.9 : 0.1;
+        break;
+    case 'cc':
+        subRisk = subValue === 'LOCAL' ? 0.01 :  // ← 在此处添加
+            config.maliciousCountries.includes(subValue) ? 0.8 : 0.2;
+        break;
                     case 'asn':
                         subRisk = this.maliciousNetworks.includes(subValue) ? 0.9 : 0.1;
                         break;
@@ -104,6 +121,13 @@ class RiskEngine {
                         subRisk = 0.5;
                 }
                 pA *= subRisk; // 各子特征攻击概率相乘
+
+                // 新增子特征日志
+                console.debug(`[攻击者概率] 特征 ${mainFeature}.${subFeature}`, {
+                    subValue: subValue.toString(),
+                    subRisk: subRisk.toFixed(2),
+                    currentPA: pA.toFixed(4)
+                });
             }
     
             // ===================== 全局概率 p_xk =====================
@@ -114,6 +138,18 @@ class RiskEngine {
                 const globalTotal = globalHistory.total[subFeature] || 1;
                 const pHistory = this._smooth(globalCount, globalTotal);
                 pXk *= pHistory; // 各子特征全局概率相乘
+
+                // 新增全局概率日志
+            console.debug(`[全局概率] 特征 ${mainFeature}.${subFeature}`, {
+                subValue: subValue.toString(),
+                globalCount,
+                globalTotal,
+                pHistory: pHistory.toFixed(4),
+                currentPXk: pXk.toFixed(4)
+            });
+
+
+
             }
     
             // ===================== 用户本地概率 p_xk_given_u_L =====================
@@ -124,10 +160,28 @@ class RiskEngine {
                 const userTotal = userHistory.total[mainFeature] || 1;
                 const userProb = this._smooth(userCount, userTotal);
                 pXkL *= userProb; // 各子特征用户概率相乘
+
+
+                // 新增用户概率日志
+            console.debug(`[用户概率] 特征 ${mainFeature}.${subFeature}`, {
+                subValue: subValue.toString(),
+                userCount,
+                userTotal,
+                userProb: userProb.toFixed(4),
+                currentPXkL: pXkL.toFixed(4)
+            });
             }
     
             // ===================== 特征贡献值 =====================
-            score *= (pA * pXk) / Math.max(pXkL, 0.01);
+            const beforeScore = score;
+        score *= (pA * pXk) / Math.max(pXkL, 0.01);
+        console.debug(`[特征贡献] ${mainFeature}`, {
+            pA: pA.toFixed(4),
+            pXk: pXk.toFixed(4),
+            pXkL: pXkL.toFixed(4),
+            contribution: (score / beforeScore).toFixed(4),
+            newScore: score.toFixed(4)
+        });
         }
     
         // ===================== 全局用户比例调整 p_u_given_A / p_u_given_L =====================
@@ -135,6 +189,17 @@ class RiskEngine {
         const pUGivenA = 1 / totalUsers; // 攻击者中该用户的概率
         const pUGivenL = userHistory.loginCount / globalHistory.loginCount || 0.01; // 正常用户中该用户的活跃度
         
+
+        // 新增比例调整日志
+    console.debug(`[比例调整] 用户 ${userId}`, {
+        totalUsers,
+        pUGivenA: pUGivenA.toExponential(2),
+        pUGivenL: pUGivenL.toExponential(2),
+        ratio: (pUGivenA / pUGivenL).toExponential(2)
+    });
+
+
+
         // 修改 calculate 方法中的 finalScore 计算
         let finalScore = Number(score * (pUGivenA / pUGivenL));
         if (isNaN(finalScore)) {
@@ -155,20 +220,20 @@ class RiskEngine {
             console.warn(`[需要验证] 用户 ${userId} 分数: ${finalScore.toFixed(2)}`);
         }
     
-        // // ===================== 保存完整日志 =====================
-        // await query(
-        //     `INSERT INTO risk_logs 
-        //     (user_id, ip_address, user_agent, geo_data, risk_score, action) 
-        //     VALUES (?, ?, ?, ?, ?, ?)`,
-        //     [
-        //         userId,
-        //         features.ip || '0.0.0.0', // 处理 ip 缺失
-        //         features.userAgent || 'Unknown',
-        //         JSON.stringify(geoData || {}), // 处理 geoData 未定义
-        //         finalScore,
-        //         action
-        //     ]
-        // );
+        // ===================== 保存完整日志 =====================
+        await query(
+            `INSERT INTO risk_logs 
+            (user_id, ip_address, user_agent, geo_data, risk_score, action) 
+            VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+                userId,
+                features.ip || '0.0.0.0', // 处理 ip 缺失
+                features.userAgent || 'Unknown',
+                JSON.stringify(geoData || {}), // 处理 geoData 未定义
+                finalScore,
+                action
+            ]
+        );
     
         return {
             score: finalScore,
@@ -199,6 +264,11 @@ class RiskEngine {
    */
   parseIP(ip) {
     try {
+
+        // 新增本地IP白名单判断
+      if(['::1', '127.0.0.1'].includes(ip)) {
+        return { ip, asn: 'Local', cc: 'LOCAL' }; // 明确标记为本地
+      }
       const geo = geoip.lookup(ip);
       if(ip=='::1'){
         return{
@@ -229,15 +299,23 @@ class RiskEngine {
       const parser = new UAParser(userAgent);
       const browser = parser.getBrowser();
       const os = parser.getOS();
+      const device = parser.getDevice();
+      
       return {
-        ua: browser.name || 'Unknown',   // 浏览器名称
-        bv: browser.version || '0.0.0',   // 浏览器版本
-        osv: os.version || 'Unknown'      // 操作系统版本
+        ua: browser.name || 'Unknown',
+        bv: this._parseVersion(browser.version), // 新增版本号格式化
+        osv: os.version || 'Unknown',
+        df: device.model ? device.model : 'desktop' // 设备信息兜底
       };
-    } catch (error) {
-      console.error('UA 解析失败:', userAgent, error);
-      return { ua: 'Unknown', bv: '0.0.0', osv: 'Unknown' };
+    } catch (e) {
+      return { ua: 'Unknown', bv: '0.0.0', osv: 'Unknown', df: 'unknown' };
     }
+  }
+
+  // 新增版本号格式化方法
+  _parseVersion(version) {
+    if (!version) return '0.0.0';
+    return version.split('.').slice(0,3).join('.');
   }
     // 特征解析（IP/UA等）
     _parseFeature(feature, data) {
@@ -262,41 +340,23 @@ class RiskEngine {
     async _getHistories(userId) {
         // 获取全局登录历史（所有用户）
         const globalHistory = {
-            loginCount: await this.history.getTotalLoginCount() || 1, // 防止除零错误
-            features: await this.history.getGlobalFeatureStats(),     // 全局特征统计
-            total: await this.history.getGlobalTotalStats()          // 全局总计数
+            loginCount: this.history.getTotalLoginCount() || 1, // 防止除零错误
+            features: this.history.getGlobalFeatureStats(),     // 全局特征统计
+            total: this.history.getGlobalTotalStats()          // 全局总计数
         };
-    
+
         // 获取用户特定历史
         let userHistory = this.history.users[userId];
         if (!userHistory) {
-            console.warn('[风险引擎] 内存中无用户历史，尝试从数据库加载', { userId });
-            
-            // 尝试从数据库初始化用户历史
-            try {
-                const result = await this.history.initializeUserHistory(userId);
-                if (result) {
-                    userHistory = this.history.users[userId];
-                    console.log('[风险引擎] 从数据库加载用户历史成功', { userId, loginCount: userHistory.loginCount });
-                } else {
-                    console.warn('[风险引擎] 数据库中无用户历史记录', { userId });
-                }
-            } catch (err) {
-                console.error('[风险引擎] 从数据库加载用户历史失败', err);
-            }
-            
-            // 如果数据库中也没有或加载失败，则创建新的历史记录
-            if (!userHistory) {
-                console.warn('[风险引擎] 用户首次登录，初始化历史记录', { userId });
-                userHistory = {
-                    loginCount: 0,
-                    features: this._initFeatureStats(), // 初始化空特征统计
-                    total: this._initTotalStats()       // 初始化空总计数
-                };
-                this.history.users[userId] = userHistory;
-            }
+            console.warn('[风险引擎] 用户首次登录，初始化历史记录', { userId });
+            userHistory = {
+                loginCount: 0,
+                features: this._initFeatureStats(), // 初始化空特征统计
+                total: this._initTotalStats()       // 初始化空总计数
+            };
+            this.history.users[userId] = userHistory;
         }
-    
+
         return {
             globalHistory,
             userHistory
