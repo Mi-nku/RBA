@@ -76,14 +76,38 @@ class RiskEngine {
     async calculate(userId, features) {
         let geoData = null;
         let score = 1.0;
+        
+        // 验证输入参数
+        console.log(`\n========== 风险计算开始 [用户ID: ${userId}] ==========`);
+        console.log(`原始输入特征:`, features);
+        
+        // 验证 userAgent 是否存在
+        if (!features.userAgent && features.ua) {
+            console.log('修正: 使用 features.ua 作为 userAgent');
+            features.userAgent = features.ua;
+        }
+        
+        // 确保 IP 地址格式正确
+        if (features.ip && features.ip.startsWith('::ffff:')) {
+            console.log('IPv6 映射的 IPv4 地址:', features.ip);
+        }
+        
+        console.log(`处理后的输入特征:`, JSON.stringify(features, null, 2));
+        
         const { globalHistory, userHistory } = await this._getHistories(userId);
     
+        console.log(`\n========== 风险计算开始 [用户ID: ${userId}] ==========`);
+        console.log(`输入特征数据:`, JSON.stringify(features, null, 2));
+        
         // 遍历所有主特征
         for (const mainFeature of Object.keys(config.coefficients)) {
             const featureValue = this._parseFeature(mainFeature, features);
+            console.log(`\n----- 主特征: ${mainFeature} -----`);
+            console.log(`解析后的特征值:`, JSON.stringify(featureValue, null, 2));
     
             // ===================== 攻击者概率 p_A_given_xk =====================
             let pA = 1.0;
+            console.log(`\n子特征攻击概率计算:`);
             for (const [subFeature, weight] of Object.entries(config.coefficients[mainFeature])) {
                 const subValue = this._parseSubFeature(subFeature, featureValue);
                 
@@ -92,48 +116,69 @@ class RiskEngine {
                 switch (subFeature) {
                     case 'asn':
                         subRisk = this.maliciousNetworks.includes(subValue) ? 0.9 : 0.1;
+                        console.log(`  - ${subFeature}: ${subValue} (${this.maliciousNetworks.includes(subValue) ? '恶意网络' : '正常网络'}) => ${subRisk}`);
                         break;
                     case 'cc':
                         subRisk = config.maliciousCountries.includes(subValue) ? 0.8 : 0.2;
+                        console.log(`  - ${subFeature}: ${subValue} (${config.maliciousCountries.includes(subValue) ? '高风险国家' : '正常国家'}) => ${subRisk}`);
                         break;
                     case 'bv':
                         const minVersion = config.minBrowserVersion[featureValue.ua] || 70;
                         subRisk = parseInt(subValue) < minVersion ? 0.7 : 0.1;
+                        console.log(`  - ${subFeature}: ${subValue} (最低要求: ${minVersion}) => ${subRisk}`);
                         break;
                     default:
                         subRisk = 0.5;
+                        console.log(`  - ${subFeature}: ${subValue} (默认风险) => ${subRisk}`);
                 }
                 pA *= subRisk; // 各子特征攻击概率相乘
             }
+            console.log(`  攻击者概率 pA = ${pA.toFixed(4)}`);
     
             // ===================== 全局概率 p_xk =====================
             let pXk = 1.0;
+            console.log(`\n全局概率计算:`);
             for (const [subFeature, weight] of Object.entries(config.coefficients[mainFeature])) {
                 const subValue = this._parseSubFeature(subFeature, featureValue);
                 const globalCount = globalHistory.features[subFeature]?.[subValue] || 0;
                 const globalTotal = globalHistory.total[subFeature] || 1;
                 const pHistory = this._smooth(globalCount, globalTotal);
+                console.log(`  - ${subFeature}: ${subValue} (出现次数: ${globalCount}/${globalTotal}) => ${pHistory.toFixed(4)}`);
                 pXk *= pHistory; // 各子特征全局概率相乘
             }
+            console.log(`  全局概率 pXk = ${pXk.toFixed(4)}`);
     
             // ===================== 用户本地概率 p_xk_given_u_L =====================
             let pXkL = 1.0;
+            console.log(`\n用户本地概率计算:`);
             for (const [subFeature, weight] of Object.entries(config.coefficients[mainFeature])) {
                 const subValue = this._parseSubFeature(subFeature, featureValue);
                 const userCount = userHistory.features[subFeature]?.[subValue] || 0;
                 const userTotal = userHistory.total[mainFeature] || 1;
                 const userProb = this._smooth(userCount, userTotal);
+                console.log(`  - ${subFeature}: ${subValue} (用户历史: ${userCount}/${userTotal}) => ${userProb.toFixed(4)}`);
                 pXkL *= userProb; // 各子特征用户概率相乘
             }
+            console.log(`  用户本地概率 pXkL = ${pXkL.toFixed(4)}`);
     
             // ===================== 特征贡献值 =====================
-            score *= (pA * pXk) / Math.max(pXkL, 0.01);
+            const featureContribution = (pA * pXk) / Math.max(pXkL, 0.01);
+            console.log(`\n特征 ${mainFeature} 贡献值 = ${featureContribution.toFixed(4)}`);
+            score *= featureContribution;
+            console.log(`当前累积分数 = ${score.toFixed(4)}`);
         }
     
         // ===================== 全局用户比例调整 p_u_given_A / p_u_given_L =====================
         const totalUsers = Object.keys(this.history.users).length || 1;
         const pUGivenA = 1 / totalUsers; // 攻击者中该用户的概率
         const pUGivenL = userHistory.loginCount / globalHistory.loginCount || 0.01; // 正常用户中该用户的活跃度
+        
+        console.log(`\n用户活跃度调整:`);
+        console.log(`  - 总用户数: ${totalUsers}`);
+        console.log(`  - 用户登录次数: ${userHistory.loginCount || 0}`);
+        console.log(`  - 全局登录总次数: ${globalHistory.loginCount}`);
+        console.log(`  - pUGivenA (攻击者中该用户概率): ${pUGivenA.toFixed(4)}`);
+        console.log(`  - pUGivenL (正常用户中该用户活跃度): ${pUGivenL.toFixed(4)}`);
         
         // 修改 calculate 方法中的 finalScore 计算
         let finalScore = Number(score * (pUGivenA / pUGivenL));
@@ -142,6 +187,8 @@ class RiskEngine {
            finalScore = 1.0; // 默认安全值
         }
         finalScore = Math.min(finalScore, 1.0);
+        console.log(`\n最终风险分数: ${finalScore.toFixed(4)}`);
+        
         // ===================== 阈值判断 =====================
         const rejectThreshold = config.risk.rejectThreshold || 0.7;
         const requestThreshold = config.risk.requestThreshold || 0.4;
@@ -153,7 +200,10 @@ class RiskEngine {
         } else if (finalScore > requestThreshold) {
             action = 'CHALLENGE';
             console.warn(`[需要验证] 用户 ${userId} 分数: ${finalScore.toFixed(2)}`);
+        } else {
+            console.log(`[允许访问] 用户 ${userId} 分数: ${finalScore.toFixed(2)}`);
         }
+        console.log(`========== 风险计算结束 [行动: ${action}] ==========\n`);
     
         // // ===================== 保存完整日志 =====================
         // await query(
@@ -226,13 +276,56 @@ class RiskEngine {
    */
   _parseUA(userAgent) {
     try {
+      console.log('正在解析 UA:', userAgent);
+      
+      if (!userAgent || typeof userAgent !== 'string') {
+        console.error('无效的 User-Agent:', userAgent);
+        return { ua: 'Unknown', bv: '0.0.0', osv: 'Unknown' };
+      }
+      
       const parser = new UAParser(userAgent);
-      const browser = parser.getBrowser();
-      const os = parser.getOS();
+      const result = parser.getResult();
+      const browser = result.browser;
+      const os = result.os;
+      
+      console.log('UA 解析结果:', {
+        browser: browser,
+        os: os,
+        engine: result.engine,
+        device: result.device,
+        cpu: result.cpu
+      });
+      
+      // 处理特殊情况：Electron 应用
+      if (userAgent.includes('Electron')) {
+        // 尝试从 UA 中提取 Chrome 版本
+        const chromeMatch = userAgent.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/);
+        const electronMatch = userAgent.match(/Electron\/(\d+\.\d+\.\d+)/);
+        
+        // 尝试提取自定义应用名称（如 Trae）
+        const customAppMatch = userAgent.match(/ ([A-Za-z]+)\/(\d+\.\d+\.\d+) /);
+        
+        const browserName = customAppMatch ? customAppMatch[1] : 'Electron';
+        const browserVersion = chromeMatch ? chromeMatch[1] : (browser.version || '0.0.0');
+        
+        console.log('检测到 Electron 应用:', {
+          name: browserName,
+          version: browserVersion,
+          electronVersion: electronMatch ? electronMatch[1] : 'unknown'
+        });
+        
+        return {
+          ua: browserName,
+          bv: browserVersion.split('.')[0] || '0', // 只取主版本号
+          osv: os.version || 'Unknown'
+        };
+      }
+      
+      // 标准浏览器
       return {
-        ua: browser.name || 'Unknown',   // 浏览器名称
-        bv: browser.version || '0.0.0',   // 浏览器版本
-        osv: os.version || 'Unknown'      // 操作系统版本
+        ua: browser.name || 'Unknown',
+        bv: browser.version ? browser.version.split('.')[0] : '0', // 只取主版本号
+        osv: os.version || 'Unknown'
       };
     } catch (error) {
       console.error('UA 解析失败:', userAgent, error);
