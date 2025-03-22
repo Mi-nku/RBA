@@ -14,6 +14,17 @@ console.log('[risk-assessment] historyStore 方法检查:', {
 const riskEngine = new RiskEngine(historyStore);
 const config = require('../src/risk/config.js'); // 导入项目内的config.js
 
+/**
+ * 生成合理的RTT随机值
+ * @returns {number} 20-300ms之间的随机RTT值
+ */
+function generateRandomRTT() {
+  // 生成20ms到300ms之间的随机值，模拟真实网络环境
+  const minRTT = 20;  // 最小RTT值(ms)
+  const maxRTT = 300; // 最大RTT值(ms)
+  return Math.floor(Math.random() * (maxRTT - minRTT + 1)) + minRTT;
+}
+
 module.exports = async (req, res, next) => {
   console.log('====== 进入风险检查中间件 ======');
   
@@ -40,21 +51,28 @@ module.exports = async (req, res, next) => {
   //const engine = new RiskEngine(historyStore);
   console.log('RiskEngine 初始化完成');
 
+  // 计算或生成RTT值
+  let rttValue;
+  if (!req._startTime || req.ip === '::1' || req.ip === '127.0.0.1') {
+    // 本地环境或无法获取准确RTT时，生成随机RTT
+    rttValue = generateRandomRTT();
+    console.log(`[本地环境] 生成随机RTT值: ${rttValue}ms`);
+  } else {
+    // 正常计算RTT
+    rttValue = Date.now() - req._startTime;
+  }
+
   const features = {
     ip: req.ip,
     ua: req.get('User-Agent'),
-    rtt: Date.now() - req._startTime
-};
+    rtt: rttValue
+  };
   console.log('提取的特征参数:', features); // 关键日志：检查传入 RiskEngine 的参数
 
   try {
     console.log('开始计算风险评分...');
     const riskResult = await riskEngine.calculate(req.user.id, features); // 返回对象 { score: number, action: string }
 
-
-    //riskResult.score = 0.5;
-    //riskResult.action = 'CHALLENGE';
-    
     // 正确提取风险评分
     const riskScore = riskResult.score.toFixed(4); // 格式化为4位小数
     const action = riskResult.action;
@@ -85,11 +103,6 @@ module.exports = async (req, res, next) => {
         });
     } else if (action === 'CHALLENGE') {
         console.log(`[需要2FA] 中等风险 (分数: ${riskScore})`);
-        // return res.status(202).json({ 
-        //     requires2FA: true, 
-        //     score: parseFloat(riskScore),
-        //     action: action 
-        // });
         return res.redirect('/verify-2fa'); // 重定向到 2FA 页面
     }
 
