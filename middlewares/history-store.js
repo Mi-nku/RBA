@@ -4,7 +4,7 @@ const config = require('../src/risk/config.js');
 
 class HistoryStore {
 
-  
+
   constructor() {
     this.users = {}; // 显式初始化 ✅
     this.pool = mysql.createPool(config.database);
@@ -23,7 +23,7 @@ class HistoryStore {
       },
       lastUpdated: 0   // 最后更新时间戳
     };
-    
+
   }
   async getGlobalFeatureStats() {
     if (Date.now() - this.cache.lastUpdated < 60000) { // 缓存1分钟
@@ -45,32 +45,32 @@ class HistoryStore {
    * @returns {Promise<number>} 插入的记录ID
    */
   async logRiskEvent({ user_id, ip_address, geo_data, risk_score, user_agent }) {
-       // 参数检查增强版
-       const missingParams = [];
-       const params = [
-           { name: 'user_id', value: user_id },
-           { name: 'ip_address', value: ip_address },
-           { name: 'geo_data', value: geo_data },
-           { name: 'risk_score', value: risk_score }
-       ];
-   
-       // 检查每个参数
-       params.forEach(param => {
-           if (!param.value) {
-               missingParams.push(param.name);
-               console.error(`[风险日志错误] 缺失参数检测: ${param.name}`, {
-                   eventType: "PARAM_MISSING",
-                   param: param.name,
-                   timestamp: new Date().toISOString()
-               });
-           }
-       });
-   
-       // 如果有缺失参数则报错
-       if (missingParams.length > 0) {
-           throw new Error(`缺少必需的参数: ${missingParams.join(', ')}`);
-       }
-  
+    // 参数检查增强版
+    const missingParams = [];
+    const params = [
+      { name: 'user_id', value: user_id },
+      { name: 'ip_address', value: ip_address },
+      { name: 'geo_data', value: geo_data },
+      { name: 'risk_score', value: risk_score }
+    ];
+
+    // 检查每个参数
+    params.forEach(param => {
+      if (!param.value) {
+        missingParams.push(param.name);
+        console.error(`[风险日志错误] 缺失参数检测: ${param.name}`, {
+          eventType: "PARAM_MISSING",
+          param: param.name,
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    // 如果有缺失参数则报错
+    if (missingParams.length > 0) {
+      throw new Error(`缺少必需的参数: ${missingParams.join(', ')}`);
+    }
+
     const connection = await this.pool.getConnection();
     try {
       const [result] = await connection.execute(
@@ -78,7 +78,7 @@ class HistoryStore {
         (user_id, ip_address, geo_data, risk_score, user_agent)
         VALUES (?, ?, ?, ?, ?)`,
         [user_id, ip_address, geo_data, risk_score, user_agent]
-    );
+      );
       return result.insertId;
     } catch (error) {
       this.handleDBError(error, '风险日志记录失败');
@@ -87,6 +87,9 @@ class HistoryStore {
       connection.release();
     }
   }
+
+
+
 
   /**
    * 获取用户风险历史（精确匹配用户ID和时间范围）
@@ -149,11 +152,11 @@ class HistoryStore {
     console.log('[HistoryStore] 数据库连接池已关闭');
   }
 
-   /**
-   * 获取全局登录总次数
-   * @returns {Promise<number>}
-   */
-   async getTotalLoginCount() {
+  /**
+  * 获取全局登录总次数
+  * @returns {Promise<number>}
+  */
+  async getTotalLoginCount() {
     const connection = await this.pool.getConnection();
     try {
       const [rows] = await connection.execute(
@@ -187,7 +190,7 @@ class HistoryStore {
         FROM risk_logs 
         GROUP BY ip_address`
       ) || [];
-      
+
       // 新增：ASN和CC统计查询
       const [geoStats] = await connection.execute(
         `SELECT 
@@ -198,7 +201,7 @@ class HistoryStore {
         WHERE geo_data IS NOT NULL AND geo_data != '{}'
         GROUP BY JSON_EXTRACT(geo_data, '$.asn'), JSON_EXTRACT(geo_data, '$.cc')`
       ) || [];
-      
+
       // UA统计查询
       const [uaRawStats] = await connection.execute(
         `SELECT 
@@ -207,10 +210,10 @@ class HistoryStore {
         FROM risk_logs 
         GROUP BY user_agent`
       ) || [];
-      
+
       // 处理UA统计数据
       const uaStats = this._processUAStats(uaRawStats);
-      
+
       // 处理ASN和CC统计
       const asnStats = {};
       const ccStats = {};
@@ -218,57 +221,57 @@ class HistoryStore {
         // 去除JSON字符串中的引号
         const asn = row.asn ? row.asn.replace(/"/g, '') : 'Unknown';
         const cc = row.cc ? row.cc.replace(/"/g, '') : 'XX';
-        
+
         asnStats[asn] = (asnStats[asn] || 0) + row.count;
         ccStats[cc] = (ccStats[cc] || 0) + row.count;
       });
-      
+
       // 修复：将对象格式转换为数组格式
       const browsersArray = Object.entries(uaStats.browsers || {}).map(([name, count]) => ({ name, count }));
       const versionsArray = Object.entries(uaStats.versions || {}).map(([version, count]) => ({ version, count }));
       const osVersionsArray = Object.entries(uaStats.osVersions || {}).map(([os, count]) => ({ os, count }));
       const devicesArray = Object.entries(uaStats.devices || {}).map(([device, count]) => ({ device, count }));
-      
+
       // 构建特征统计结构
       const featureStats = {
-          ip: this._arrayToObject(Array.isArray(ipStats) ? ipStats : [], 'feature', 'count'),
-          asn: asnStats,  // 新增ASN统计
-          cc: ccStats,    // 新增CC统计
-          ua: this._arrayToObject(browsersArray, 'name', 'count'),
-          bv: this._arrayToObject(versionsArray, 'version', 'count'),
-          osv: this._arrayToObject(osVersionsArray, 'os', 'count'),
-          df: this._arrayToObject(devicesArray, 'device', 'count'),
-          rtt: {} // 初始化空结构
+        ip: this._arrayToObject(Array.isArray(ipStats) ? ipStats : [], 'feature', 'count'),
+        asn: asnStats,  // 新增ASN统计
+        cc: ccStats,    // 新增CC统计
+        ua: this._arrayToObject(browsersArray, 'name', 'count'),
+        bv: this._arrayToObject(versionsArray, 'version', 'count'),
+        osv: this._arrayToObject(osVersionsArray, 'os', 'count'),
+        df: this._arrayToObject(devicesArray, 'device', 'count'),
+        rtt: {} // 初始化空结构
       };
-      
+
       console.debug('[全局特征统计生成]', {
-          ipCount: Object.keys(featureStats.ip).length,
-          asnCount: Object.keys(featureStats.asn).length,
-          ccCount: Object.keys(featureStats.cc).length,
-          uaCount: Object.keys(featureStats.ua).length,
-          bvCount: Object.keys(featureStats.bv).length,
-          osvCount: Object.keys(featureStats.osv).length,
-          dfCount: Object.keys(featureStats.df).length
+        ipCount: Object.keys(featureStats.ip).length,
+        asnCount: Object.keys(featureStats.asn).length,
+        ccCount: Object.keys(featureStats.cc).length,
+        uaCount: Object.keys(featureStats.ua).length,
+        bvCount: Object.keys(featureStats.bv).length,
+        osvCount: Object.keys(featureStats.osv).length,
+        dfCount: Object.keys(featureStats.df).length
       });
-      
+
       return featureStats;
     } catch (error) {
       console.error('[全局特征统计失败]', error.stack);
       // 返回完整结构兜底
-      return { 
-          ip: {}, 
-          asn: {},  // 新增
-          cc: {},   // 新增
-          ua: {}, 
-          bv: {}, 
-          osv: {}, 
-          df: {}, 
-          rtt: {} 
+      return {
+        ip: {},
+        asn: {},  // 新增
+        cc: {},   // 新增
+        ua: {},
+        bv: {},
+        osv: {},
+        df: {},
+        rtt: {}
       };
     } finally {
       connection.release();
     }
-}
+  }
 
   // 新增：处理UA统计数据的辅助方法
   _processUAStats(uaRawStats) {
@@ -277,26 +280,26 @@ class HistoryStore {
     const versions = {};
     const osVersions = {};
     const devices = {};
-  
+
     uaRawStats.forEach(item => {
       try {
         const parser = new UAParser(item.feature);
         const browser = parser.getBrowser();
         const os = parser.getOS();
         const device = parser.getDevice();
-        
+
         // 浏览器名称统计
         const browserName = browser.name || 'Unknown';
         browsers[browserName] = (browsers[browserName] || 0) + item.count;
-        
+
         // 浏览器版本统计
         const browserVersion = this._parseVersion(browser.version);
         versions[browserVersion] = (versions[browserVersion] || 0) + item.count;
-        
+
         // 操作系统版本统计
         const osVersion = os.version || 'Unknown';
         osVersions[osVersion] = (osVersions[osVersion] || 0) + item.count;
-        
+
         // 设备类型统计
         const deviceType = device.model ? device.model : 'desktop';
         devices[deviceType] = (devices[deviceType] || 0) + item.count;
@@ -304,20 +307,20 @@ class HistoryStore {
         console.error('UA解析失败:', e);
       }
     });
-  
+
     return { browsers, versions, osVersions, devices };
   }
 
   // 辅助方法：解析版本号
   _parseVersion(version) {
     if (!version) return '0.0.0';
-    return version.split('.').slice(0,3).join('.');
+    return version.split('.').slice(0, 3).join('.');
   }
 
   // 辅助方法：将数组转换为对象
   _arrayToObject(array, keyField, valueField) {
     const result = {};
-    
+
     // 添加类型检查，确保 array 是数组
     if (!Array.isArray(array)) {
       console.warn('[HistoryStore] _arrayToObject 接收到非数组参数:', {
@@ -326,7 +329,7 @@ class HistoryStore {
       });
       return result; // 返回空对象
     }
-    
+
     array.forEach(item => {
       result[item[keyField]] = item[valueField];
     });
@@ -340,21 +343,21 @@ class HistoryStore {
    */
   async getGlobalTotalStats(forceRefresh = false) {
     // 检查缓存
-    if (!forceRefresh && 
-        Date.now() - this.cache.lastUpdated < 60000 && 
-        Object.keys(this.cache.globalStats.totalStats).length > 0) {
+    if (!forceRefresh &&
+      Date.now() - this.cache.lastUpdated < 60000 &&
+      Object.keys(this.cache.globalStats.totalStats).length > 0) {
       return this.cache.globalStats.totalStats;
     }
-  
+
     const connection = await this.pool.getConnection();
     try {
       // 获取总记录数
       const [total] = await connection.execute(
         `SELECT COUNT(*) AS total_records FROM risk_logs`
       );
-      
+
       const totalRecords = total[0].total_records || 0;
-      
+
       // 构建总计数对象 - 所有特征使用相同的总记录数
       const totalStats = {
         ip: totalRecords,
@@ -366,11 +369,11 @@ class HistoryStore {
         df: totalRecords,
         rtt: totalRecords
       };
-      
+
       // 更新缓存
       this.cache.globalStats.totalStats = totalStats;
       this.cache.lastUpdated = Date.now();
-      
+
       return totalStats;
     } catch (error) {
       this.handleDBError(error, '全局总计数查询失败');
@@ -379,40 +382,40 @@ class HistoryStore {
       connection.release();
     }
   }
-   /**
-   * 获取UA相关子特征的不同值数量
-   * @returns {Promise<Object>}
-   * @private
-   */
+  /**
+  * 获取UA相关子特征的不同值数量
+  * @returns {Promise<Object>}
+  * @private
+  */
   async _getUADistinctCounts() {
     const connection = await this.pool.getConnection();
     try {
       const [uaRawStats] = await connection.execute(
         `SELECT user_agent FROM risk_logs`
       );
-      
+
       const UAParser = require('ua-parser-js');
       const versions = new Set();
       const osVersions = new Set();
       const devices = new Set();
-      
+
       uaRawStats.forEach(row => {
         try {
           const parser = new UAParser(row.user_agent);
           const browser = parser.getBrowser();
           const os = parser.getOS();
           const device = parser.getDevice();
-          
+
           // 收集不同的浏览器版本
           if (browser.version) {
             versions.add(this._parseVersion(browser.version));
           }
-          
+
           // 收集不同的操作系统版本
           if (os.version) {
             osVersions.add(os.version);
           }
-          
+
           // 收集不同的设备类型
           const deviceType = device.model ? device.model : 'desktop';
           devices.add(deviceType);
@@ -420,7 +423,7 @@ class HistoryStore {
           console.error('UA解析失败:', e);
         }
       });
-      
+
       return {
         bv: versions.size,
         osv: osVersions.size,
@@ -441,25 +444,25 @@ class HistoryStore {
    */
   async initializeUserHistory(userId, forceRefresh = false) {
     if (!userId) return null;
-    
+
     // 如果已经在缓存中且不需要强制刷新，直接返回
     if (this.users[userId] && !forceRefresh) {
       console.log(`[HistoryStore] 用户历史已在缓存中: ${userId}`);
       return this.users[userId];
     }
-    
+
     console.log(`[HistoryStore] 从数据库加载用户历史: ${userId}`);
     const connection = await this.pool.getConnection();
     try {
       // 检查是否为用户名而非用户ID
       let userIdForQuery = userId;
       let userIdForCache = userId;
-      
+
       // 尝试从users.json文件中查找用户ID
       try {
         const fs = require('fs');
         const usersData = JSON.parse(fs.readFileSync('d:/RBA/rba/users.json', 'utf8'));
-        
+
         // 如果输入的是用户名，查找对应的用户ID
         if (isNaN(userId) || userId.length < 10) {
           const user = usersData.find(u => u.username === userId);
@@ -468,7 +471,7 @@ class HistoryStore {
             console.log(`[HistoryStore] 用户名 ${userId} 映射到用户ID: ${userIdForQuery}`);
             userIdForCache = userIdForQuery; // 使用用户ID作为缓存键
           }
-        } 
+        }
         // 如果输入的是用户ID，也记录用户名用于日志
         else {
           const user = usersData.find(u => u.id === userId);
@@ -480,7 +483,7 @@ class HistoryStore {
         console.error('[HistoryStore] 读取users.json失败:', err);
         // 继续使用原始userId
       }
-      
+
       // 获取登录次数
       const [loginCountResult] = await connection.execute(
         `SELECT COUNT(*) AS loginCount 
@@ -488,10 +491,10 @@ class HistoryStore {
         WHERE user_id = ?`,
         [userIdForQuery]
       );
-      
+
       const loginCount = loginCountResult[0].loginCount || 0;
       console.log(`[HistoryStore] 用户 ${userIdForQuery} 登录次数: ${loginCount}`);
-  
+
       // 获取IP统计
       const [ipStatsResult] = await connection.execute(
         `SELECT 
@@ -502,7 +505,7 @@ class HistoryStore {
         GROUP BY ip_address`,
         [userIdForQuery]
       );
-      
+
       // 获取UA统计
       const [uaStatsResult] = await connection.execute(
         `SELECT 
@@ -513,7 +516,7 @@ class HistoryStore {
         GROUP BY user_agent`,
         [userIdForQuery]
       );
-      
+
       // 获取地理位置数据统计
       const [geoStatsResult] = await connection.execute(
         `SELECT 
@@ -525,7 +528,7 @@ class HistoryStore {
         GROUP BY JSON_EXTRACT(geo_data, '$.asn'), JSON_EXTRACT(geo_data, '$.cc')`,
         [userIdForQuery]
       );
-      
+
       console.log(`[HistoryStore] 用户 ${userIdForQuery} 统计结果:`, {
         ipCount: ipStatsResult.length,
         uaCount: uaStatsResult.length,
@@ -537,17 +540,17 @@ class HistoryStore {
         acc[row.ip] = row.count;
         return acc;
       }, {});
-      
+
       // 处理UA统计 - 修复：确保UA数据正确转换
       const uaRawStats = uaStatsResult.map(row => ({ feature: row.ua, count: row.count }));
       const uaStats = this._processUAStats(uaRawStats);
-      
+
       // 修复：将对象格式转换为数组格式，以便_arrayToObject方法可以正确处理
       const browsersArray = Object.entries(uaStats.browsers || {}).map(([name, count]) => ({ name, count }));
       const versionsArray = Object.entries(uaStats.versions || {}).map(([version, count]) => ({ version, count }));
       const osVersionsArray = Object.entries(uaStats.osVersions || {}).map(([os, count]) => ({ os, count }));
       const devicesArray = Object.entries(uaStats.devices || {}).map(([device, count]) => ({ device, count }));
-      
+
       // 处理地理位置统计
       const asnStats = {};
       const ccStats = {};
@@ -555,67 +558,67 @@ class HistoryStore {
         // 去除JSON字符串中的引号
         const asn = row.asn ? row.asn.replace(/"/g, '') : 'Unknown';
         const cc = row.cc ? row.cc.replace(/"/g, '') : 'XX';
-        
+
         asnStats[asn] = (asnStats[asn] || 0) + row.count;
         ccStats[cc] = (ccStats[cc] || 0) + row.count;
       });
-      
+
       // 构建UA相关特征对象 - 使用转换后的数组
       const uaFeatures = this._arrayToObject(browsersArray, 'name', 'count');
       const bvFeatures = this._arrayToObject(versionsArray, 'version', 'count');
       const osvFeatures = this._arrayToObject(osVersionsArray, 'os', 'count');
       const dfFeatures = this._arrayToObject(devicesArray, 'device', 'count');
-      
-     // 使用正确的用户ID作为缓存键
-     this.users[userIdForCache] = {
-      loginCount: loginCount,
-      features: { 
-        ip: ipStats,
-        ua: uaFeatures,
-        bv: bvFeatures,
-        osv: osvFeatures,
-        df: dfFeatures,
-        asn: asnStats,
-        cc: ccStats
-      },
-      total: { 
-        ip: ipStatsResult.length || 0, 
-        ua: uaStatsResult.length || 0,
-        asn: Object.keys(asnStats).length || 0,
-        cc: Object.keys(ccStats).length || 0,
-        bv: Object.keys(bvFeatures).length || 0,
-        osv: Object.keys(osvFeatures).length || 0,
-        df: Object.keys(dfFeatures).length || 0,
-        rtt: 0 
+
+      // 使用正确的用户ID作为缓存键
+      this.users[userIdForCache] = {
+        loginCount: loginCount,
+        features: {
+          ip: ipStats,
+          ua: uaFeatures,
+          bv: bvFeatures,
+          osv: osvFeatures,
+          df: dfFeatures,
+          asn: asnStats,
+          cc: ccStats
+        },
+        total: {
+          ip: ipStatsResult.length || 0,
+          ua: uaStatsResult.length || 0,
+          asn: Object.keys(asnStats).length || 0,
+          cc: Object.keys(ccStats).length || 0,
+          bv: Object.keys(bvFeatures).length || 0,
+          osv: Object.keys(osvFeatures).length || 0,
+          df: Object.keys(dfFeatures).length || 0,
+          rtt: 0
+        }
+      };
+
+      // 同时在用户名和用户ID下都缓存相同的数据（如果它们不同）
+      if (userId !== userIdForCache) {
+        this.users[userId] = this.users[userIdForCache];
       }
-    };
-    
-    // 同时在用户名和用户ID下都缓存相同的数据（如果它们不同）
-    if (userId !== userIdForCache) {
-      this.users[userId] = this.users[userIdForCache];
+
+      console.log(`[HistoryStore] 用户历史加载成功: ${userIdForCache}`, {
+        loginCount: this.users[userIdForCache].loginCount,
+        ipCount: Object.keys(this.users[userIdForCache].features.ip).length,
+        uaCount: Object.keys(this.users[userIdForCache].features.ua).length,
+        asnCount: Object.keys(this.users[userIdForCache].features.asn).length,
+        ccCount: Object.keys(this.users[userIdForCache].features.cc).length
+      });
+
+      return this.users[userIdForCache];
+    } catch (error) {
+      console.error(`[HistoryStore] 用户历史初始化失败: ${userId}`, error);
+      // 返回默认结构，防止后续代码出错
+      this.users[userId] = {
+        loginCount: 0,
+        features: { ip: {}, ua: {}, bv: {}, osv: {}, df: {}, asn: {}, cc: {} },
+        total: { ip: 0, ua: 0, asn: 0, cc: 0, bv: 0, osv: 0, df: 0, rtt: 0 }
+      };
+      return this.users[userId];
+    } finally {
+      connection.release();
     }
-    
-    console.log(`[HistoryStore] 用户历史加载成功: ${userIdForCache}`, {
-      loginCount: this.users[userIdForCache].loginCount,
-      ipCount: Object.keys(this.users[userIdForCache].features.ip).length,
-      uaCount: Object.keys(this.users[userIdForCache].features.ua).length,
-      asnCount: Object.keys(this.users[userIdForCache].features.asn).length,
-      ccCount: Object.keys(this.users[userIdForCache].features.cc).length
-    });
-    
-    return this.users[userIdForCache];
-  } catch (error) {
-    console.error(`[HistoryStore] 用户历史初始化失败: ${userId}`, error);
-    // 返回默认结构，防止后续代码出错
-    this.users[userId] = {
-      loginCount: 0,
-      features: { ip: {}, ua: {}, bv: {}, osv: {}, df: {}, asn: {}, cc: {} },
-      total: { ip: 0, ua: 0, asn: 0, cc: 0, bv: 0, osv: 0, df: 0, rtt: 0 }
-    };
-    return this.users[userId];
-  } finally {
-    connection.release();
-  }
   }
 
   /**
@@ -653,12 +656,12 @@ class HistoryStore {
     console.log('[HistoryStore] 开始强制刷新所有缓存');
     this.clearGlobalCache();
     this.clearUserCache();
-    
+
     // 重新加载全局统计
     await this.getTotalLoginCount();
     await this.getGlobalFeatureStats();
     await this.getGlobalTotalStats(true);
-    
+
     console.log('[HistoryStore] 所有缓存刷新完成');
   }
 }
