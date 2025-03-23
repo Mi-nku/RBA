@@ -433,5 +433,14 @@
     "createdAt": "2025-03-09T06:51:29.942Z",
     "lastLogin": null,
     "loginHistory": []
+  },
+  {
+    "id": "1742727893857",
+    "username": "111",
+    "email": "2274394870@qq.com",
+    "password": "$2b$10$fKoFUiIIEPODECQfYHx3GuPCBiM6dnlJZKy9isCBSs7x8Cr1DVMdu",
+    "createdAt": "2025-03-23T11:04:53.857Z",
+    "lastLogin": null,
+    "loginHistory": []
   }
 ]

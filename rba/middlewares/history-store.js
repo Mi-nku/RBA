@@ -188,6 +188,17 @@ class HistoryStore {
         GROUP BY ip_address`
       ) || [];
       
+      // 新增：ASN和CC统计查询
+      const [geoStats] = await connection.execute(
+        `SELECT 
+          JSON_EXTRACT(geo_data, '$.asn') AS asn,
+          JSON_EXTRACT(geo_data, '$.cc') AS cc,
+          COUNT(*) AS count
+        FROM risk_logs 
+        WHERE geo_data IS NOT NULL AND geo_data != '{}'
+        GROUP BY JSON_EXTRACT(geo_data, '$.asn'), JSON_EXTRACT(geo_data, '$.cc')`
+      ) || [];
+      
       // UA统计查询
       const [uaRawStats] = await connection.execute(
         `SELECT 
@@ -200,6 +211,18 @@ class HistoryStore {
       // 处理UA统计数据
       const uaStats = this._processUAStats(uaRawStats);
       
+      // 处理ASN和CC统计
+      const asnStats = {};
+      const ccStats = {};
+      geoStats.forEach(row => {
+        // 去除JSON字符串中的引号
+        const asn = row.asn ? row.asn.replace(/"/g, '') : 'Unknown';
+        const cc = row.cc ? row.cc.replace(/"/g, '') : 'XX';
+        
+        asnStats[asn] = (asnStats[asn] || 0) + row.count;
+        ccStats[cc] = (ccStats[cc] || 0) + row.count;
+      });
+      
       // 修复：将对象格式转换为数组格式
       const browsersArray = Object.entries(uaStats.browsers || {}).map(([name, count]) => ({ name, count }));
       const versionsArray = Object.entries(uaStats.versions || {}).map(([version, count]) => ({ version, count }));
@@ -209,19 +232,23 @@ class HistoryStore {
       // 构建特征统计结构
       const featureStats = {
           ip: this._arrayToObject(Array.isArray(ipStats) ? ipStats : [], 'feature', 'count'),
-          ua: {
-              ua: this._arrayToObject(browsersArray, 'name', 'count'),
-              bv: this._arrayToObject(versionsArray, 'version', 'count'),
-              osv: this._arrayToObject(osVersionsArray, 'os', 'count'),
-              df: this._arrayToObject(devicesArray, 'device', 'count')
-          },
+          asn: asnStats,  // 新增ASN统计
+          cc: ccStats,    // 新增CC统计
+          ua: this._arrayToObject(browsersArray, 'name', 'count'),
+          bv: this._arrayToObject(versionsArray, 'version', 'count'),
+          osv: this._arrayToObject(osVersionsArray, 'os', 'count'),
+          df: this._arrayToObject(devicesArray, 'device', 'count'),
           rtt: {} // 初始化空结构
       };
       
       console.debug('[全局特征统计生成]', {
           ipCount: Object.keys(featureStats.ip).length,
-          uaCount: Object.keys(featureStats.ua.ua).length,
-          bvCount: Object.keys(featureStats.ua.bv).length
+          asnCount: Object.keys(featureStats.asn).length,
+          ccCount: Object.keys(featureStats.cc).length,
+          uaCount: Object.keys(featureStats.ua).length,
+          bvCount: Object.keys(featureStats.bv).length,
+          osvCount: Object.keys(featureStats.osv).length,
+          dfCount: Object.keys(featureStats.df).length
       });
       
       return featureStats;
@@ -230,13 +257,18 @@ class HistoryStore {
       // 返回完整结构兜底
       return { 
           ip: {}, 
-          ua: { ua: {}, bv: {}, osv: {}, df: {} }, 
+          asn: {},  // 新增
+          cc: {},   // 新增
+          ua: {}, 
+          bv: {}, 
+          osv: {}, 
+          df: {}, 
           rtt: {} 
       };
     } finally {
       connection.release();
     }
-  }
+}
 
   // 新增：处理UA统计数据的辅助方法
   _processUAStats(uaRawStats) {
@@ -316,62 +348,33 @@ class HistoryStore {
   
     const connection = await this.pool.getConnection();
     try {
-      // 获取IP和UA的总计数
+      // 获取总记录数
       const [total] = await connection.execute(
-        `SELECT 
-          COUNT(DISTINCT ip_address) AS ip,
-          COUNT(DISTINCT user_agent) AS ua,
-          COUNT(*) AS total_records
-        FROM risk_logs`
-      );
-  
-      // 获取ASN和国家代码的不同值数量
-      const [geoStats] = await connection.execute(
-        `SELECT 
-          COUNT(DISTINCT JSON_EXTRACT(geo_data, '$.asn')) AS asn_count,
-          COUNT(DISTINCT JSON_EXTRACT(geo_data, '$.cc')) AS cc_count
-        FROM risk_logs 
-        WHERE geo_data IS NOT NULL AND geo_data != '{}'`
-      );
-  
-      // 获取UA相关特征的不同值数量
-      const [uaDistinct] = await connection.execute(
-        `SELECT COUNT(DISTINCT user_agent) AS ua_count FROM risk_logs`
+        `SELECT COUNT(*) AS total_records FROM risk_logs`
       );
       
-      // 构建完整的总计数结构
+      const totalRecords = total[0].total_records || 0;
+      
+      // 构建总计数对象 - 所有特征使用相同的总记录数
       const totalStats = {
-        // 主特征总计数
-        ip: total[0].ip || 0,
-        ua: total[0].ua || 0,
-        rtt: 0, // 根据实际需求实现
-        
-        // 子特征总计数
-        'ip': total[0].ip || 0,
-        'asn': geoStats[0].asn_count || 0,
-        'cc': geoStats[0].cc_count || 0,
-        
-        'ua': total[0].ua || 0,
-        'bv': uaDistinct[0].ua_count || 0,  // 使用UA数量作为浏览器版本数量的近似值
-        'osv': uaDistinct[0].ua_count || 0, // 使用UA数量作为操作系统版本数量的近似值
-        'df': uaDistinct[0].ua_count || 0   // 使用UA数量作为设备类型数量的近似值
+        ip: totalRecords,
+        ua: totalRecords,
+        asn: totalRecords,
+        cc: totalRecords,
+        bv: totalRecords,
+        osv: totalRecords,
+        df: totalRecords,
+        rtt: totalRecords
       };
-  
+      
       // 更新缓存
       this.cache.globalStats.totalStats = totalStats;
       this.cache.lastUpdated = Date.now();
       
-      console.log('[全局总计数]', totalStats);
-      
       return totalStats;
     } catch (error) {
       this.handleDBError(error, '全局总计数查询失败');
-      // 返回默认值防止错误传播
-      return { 
-        ip: 1, ua: 1, rtt: 1,
-        'ip': 1, 'asn': 1, 'cc': 1,
-        'ua': 1, 'bv': 1, 'osv': 1, 'df': 1
-      };
+      return {};
     } finally {
       connection.release();
     }

@@ -105,18 +105,12 @@ class RiskEngine {
                 let subRisk;
                 switch (subFeature) {
                     case 'asn':
-        subRisk = subValue === 'Local' ? 0.01 :  // ← 在此处添加
-            this.maliciousNetworks.includes(subValue) ? 0.9 : 0.1;
-        break;
-    case 'cc':
-        subRisk = subValue === 'LOCAL' ? 0.01 :  // ← 在此处添加
-            config.maliciousCountries.includes(subValue) ? 0.8 : 0.2;
-        break;
-                    case 'asn':
-                        subRisk = this.maliciousNetworks.includes(subValue) ? 0.9 : 0.1;
+                        subRisk = subValue === 'Local' ? 0.01 :  
+                            this.maliciousNetworks.includes(subValue) ? 0.9 : 0.1;
                         break;
                     case 'cc':
-                        subRisk = config.maliciousCountries.includes(subValue) ? 0.8 : 0.2;
+                        subRisk = subValue === 'LOCAL' ? 0.01 :  
+                            config.maliciousCountries.includes(subValue) ? 0.8 : 0.2;
                         break;
                     case 'bv':
                         const minVersion = config.minBrowserVersion[featureValue.ua] || 70;
@@ -185,34 +179,39 @@ class RiskEngine {
     
             // ===================== 特征贡献值 =====================
             const beforeScore = score;
-        score *= (pA * pXk) / Math.max(pXkL, 0.01);
-        console.debug(`[特征贡献] ${mainFeature}`, {
-            pA: pA.toFixed(4),
-            pXk: pXk.toFixed(4),
-            pXkL: pXkL.toFixed(4),
-            contribution: (score / beforeScore).toFixed(4),
-            newScore: score.toFixed(4)
-        });
+            // 在特征贡献值计算中添加保护措施
+            score *= (pA * pXk) / Math.max(pXkL, 0.01);  // 确保分母至少为0.01
+            
+            // 在特征贡献值计算中添加最小值保护
+            if (score < 0.0001) {
+                console.warn(`[警告] 风险分数过小: ${score.toExponential(4)}，已调整为最小值`);
+                score = 0.0001;  // 防止数值下溢
+            }
+            
+            console.debug(`[特征贡献] ${mainFeature}`, {
+                pA: pA.toFixed(4),
+                pXk: pXk.toFixed(4),
+                pXkL: pXkL.toFixed(4),
+                contribution: (score / beforeScore).toFixed(4),
+                newScore: score.toFixed(4)
+            });
         }
-    
+        
         // ===================== 全局用户比例调整 p_u_given_A / p_u_given_L =====================
         const totalUsers = Object.keys(this.history.users).length || 1;
         const pUGivenA = 1 / totalUsers; // 攻击者中该用户的概率
         const pUGivenL = userHistory.loginCount / globalHistory.loginCount || 0.01; // 正常用户中该用户的活跃度
         
-
         // 新增比例调整日志
-    console.debug(`[比例调整] 用户 ${userId}`, {
-        totalUsers,
-        pUGivenA: pUGivenA.toExponential(2),
-        pUGivenL: pUGivenL.toExponential(2),
-        ratio: (pUGivenA / pUGivenL).toExponential(2)
-    });
+        console.debug(`[比例调整] 用户 ${userId}`, {
+            totalUsers,
+            pUGivenA: pUGivenA.toExponential(2),
+            pUGivenL: pUGivenL.toExponential(2),
+            ratio: (pUGivenA / pUGivenL).toExponential(2)
+        });
 
-
-
-        // 修改 calculate 方法中的 finalScore 计算
-        let finalScore = Number(score * (pUGivenA / pUGivenL));
+        // 计算最终分数
+        let finalScore = Number(score * (pUGivenA / Math.max(pUGivenL, 0.001)));
         if (isNaN(finalScore)) {
            console.error('风险评估异常: 最终分数为 NaN', { score, pUGivenA, pUGivenL });
            finalScore = 1.0; // 默认安全值
@@ -371,17 +370,44 @@ _smoothProbability(count, total, alpha = 1) {
     }
 
     _calcGlobalProb(feature, value, history) {
-        // 修改特征路径访问方式
+        // 解析特征路径
         const [mainFeature, subFeature] = feature.split('.');
-        const counter = history.features[mainFeature]?.[subFeature]?.[value] || 0;
-        const total = history.total[mainFeature] || 1;
+        let counter = 0;
+        
+        // 根据特征类型正确访问计数
+        if (subFeature) {
+            // 复合特征处理
+            if (mainFeature === 'ip') {
+                if (subFeature === 'asn' || subFeature === 'cc') {
+                    // IP的ASN和CC子特征直接从对应特征中获取
+                    counter = history.features[subFeature]?.[value] || 0;
+                } else {
+                    // 其他IP子特征
+                    counter = history.features.ip?.[subFeature]?.[value] || 0;
+                }
+            } else if (mainFeature === 'ua') {
+                // UA的子特征直接从对应特征中获取
+                counter = history.features[subFeature]?.[value] || 0;
+            } else {
+                // 其他复合特征
+                counter = history.features[mainFeature]?.[subFeature]?.[value] || 0;
+            }
+        } else {
+            // 简单特征
+            counter = history.features[mainFeature]?.[value] || 0;
+        }
+        
+        // 使用正确的总计数
+        const total = history.total[subFeature || mainFeature] || 1;
         
         console.debug('[全局概率计算]', {
             mainFeature,
             subFeature,
             value,
-            counter,
-            total
+            globalCount: counter,
+            globalTotal: total,
+            pHistory: this._smooth(counter, total).toFixed(4),
+            currentPXk: (this._smooth(counter, total) * (history.features[subFeature || mainFeature] ? 1 : 0)).toFixed(4)
         });
         
         return this._smooth(counter, total);
@@ -400,25 +426,22 @@ _smoothProbability(count, total, alpha = 1) {
         const globalLoginCount = await this.history.getTotalLoginCount() || 1;
         const globalFeatures = await this.history.getGlobalFeatureStats() || {};
         const globalTotals = await this.history.getGlobalTotalStats() || {};
-
+    
         // 构建正确的全局历史结构
         const globalHistory = {
             loginCount: globalLoginCount,
             features: globalFeatures,
             total: globalTotals
         };
-
-        // 重构特征数据结构以匹配后续代码期望的格式
-        // 将 ip 特征直接映射
-        globalHistory.features.ip = globalFeatures.ip || {};
-        globalHistory.features.asn = {}; // 初始化ASN特征
-        globalHistory.features.cc = {};  // 初始化国家代码特征
-        
-        // 处理UA相关特征
-        globalHistory.features.ua = globalFeatures.ua?.ua || {};
-        globalHistory.features.bv = globalFeatures.ua?.bv || {};
-        globalHistory.features.osv = globalFeatures.ua?.osv || {};
-        globalHistory.features.df = globalFeatures.ua?.df || {};
+    
+        // 确保所有特征对象都存在，防止空引用错误
+        if (!globalHistory.features.ip) globalHistory.features.ip = {};
+        if (!globalHistory.features.asn) globalHistory.features.asn = {};
+        if (!globalHistory.features.cc) globalHistory.features.cc = {};
+        if (!globalHistory.features.ua) globalHistory.features.ua = {};
+        if (!globalHistory.features.bv) globalHistory.features.bv = {};
+        if (!globalHistory.features.osv) globalHistory.features.osv = {};
+        if (!globalHistory.features.df) globalHistory.features.df = {};
         
         // 调试日志：检查全局特征统计
         console.debug('[全局特征统计]', {
@@ -426,9 +449,14 @@ _smoothProbability(count, total, alpha = 1) {
             featureKeys: Object.keys(globalHistory.features),
             totalKeys: Object.keys(globalHistory.total),
             ipSampleCount: Object.keys(globalHistory.features.ip || {}).length,
-            uaSampleCount: Object.keys(globalHistory.features.ua || {}).length
+            asnSampleCount: Object.keys(globalHistory.features.asn || {}).length,
+            ccSampleCount: Object.keys(globalHistory.features.cc || {}).length,
+            uaSampleCount: Object.keys(globalHistory.features.ua || {}).length,
+            bvSampleCount: Object.keys(globalHistory.features.bv || {}).length,
+            osvSampleCount: Object.keys(globalHistory.features.osv || {}).length,
+            dfSampleCount: Object.keys(globalHistory.features.df || {}).length
         });
-
+    
         // 强制从数据库获取最新的用户历史数据
         let userHistory = await this.history.initializeUserHistory(userId);
         
@@ -440,8 +468,11 @@ _smoothProbability(count, total, alpha = 1) {
                 total: { ip: 0, ua: 0, asn: 0, cc: 0, bv: 0, osv: 0, df: 0, rtt: 0 }
             };
             this.history.users[userId] = userHistory;
+        } else {
+            // 修复用户历史记录中的总计数
+            this._fixUserHistoryTotals(userHistory);
         }
-
+    
         // 调试日志：检查用户特征统计
         console.debug('[用户特征统计]', {
             userId,
@@ -451,11 +482,42 @@ _smoothProbability(count, total, alpha = 1) {
             ipCount: Object.keys(userHistory.features.ip || {}).length,
             uaCount: Object.keys(userHistory.features.ua || {}).length
         });
-
+    
         return {
             globalHistory,
             userHistory
         };
+    }
+
+    /**
+     * 修复用户历史记录中的总计数
+     * @param {Object} userHistory - 用户历史记录
+     */
+    _fixUserHistoryTotals(userHistory) {
+        try {
+            // 修复IP相关特征的总计数
+            userHistory.total.ip = Object.values(userHistory.features.ip || {}).reduce((sum, count) => sum + count, 0);
+            userHistory.total.asn = Object.values(userHistory.features.asn || {}).reduce((sum, count) => sum + count, 0);
+            userHistory.total.cc = Object.values(userHistory.features.cc || {}).reduce((sum, count) => sum + count, 0);
+            
+            // 修复UA相关特征的总计数
+            userHistory.total.ua = Object.values(userHistory.features.ua || {}).reduce((sum, count) => sum + count, 0);
+            userHistory.total.bv = Object.values(userHistory.features.bv || {}).reduce((sum, count) => sum + count, 0);
+            userHistory.total.osv = Object.values(userHistory.features.osv || {}).reduce((sum, count) => sum + count, 0);
+            userHistory.total.df = Object.values(userHistory.features.df || {}).reduce((sum, count) => sum + count, 0);
+            
+            console.debug('[用户历史] 总计数修复完成', {
+                ip: userHistory.total.ip,
+                ua: userHistory.total.ua,
+                bv: userHistory.total.bv,
+                osv: userHistory.total.osv,
+                df: userHistory.total.df,
+                asn: userHistory.total.asn,
+                cc: userHistory.total.cc
+            });
+        } catch (error) {
+            console.error('[用户历史] 总计数修复失败', error);
+        }
     }
 
     // 辅助方法：初始化特征统计结构 - 修改为正确的嵌套结构
@@ -510,7 +572,7 @@ _smoothProbability(count, total, alpha = 1) {
                 const ipValue = features.ip.ip;
                 if (ipValue) {
                     userHistory.features.ip[ipValue] = (userHistory.features.ip[ipValue] || 0) + 1;
-                    userHistory.total.ip = Object.keys(userHistory.features.ip).length;
+                    userHistory.total.ip = (userHistory.total.ip || 0) + 1; // 累加总次数而不是计算不同值的数量
                 }
                 
                 // 更新ASN特征
@@ -531,25 +593,28 @@ _smoothProbability(count, total, alpha = 1) {
                 const uaValue = features.ua.ua;
                 if (uaValue) {
                     userHistory.features.ua[uaValue] = (userHistory.features.ua[uaValue] || 0) + 1;
-                    userHistory.total.ua = Object.keys(userHistory.features.ua).length;
+                    userHistory.total.ua = (userHistory.total.ua || 0) + 1; // 累加总次数
                 }
                 
                 // 更新浏览器版本特征
                 const bvValue = features.ua.bv;
                 if (bvValue) {
                     userHistory.features.bv[bvValue] = (userHistory.features.bv[bvValue] || 0) + 1;
+                    userHistory.total.bv = (userHistory.total.bv || 0) + 1; // 累加总次数
                 }
                 
                 // 更新操作系统版本特征
                 const osvValue = features.ua.osv;
                 if (osvValue) {
                     userHistory.features.osv[osvValue] = (userHistory.features.osv[osvValue] || 0) + 1;
+                    userHistory.total.osv = (userHistory.total.osv || 0) + 1; // 累加总次数
                 }
                 
                 // 更新设备类型特征
                 const dfValue = features.ua.df;
                 if (dfValue) {
                     userHistory.features.df[dfValue] = (userHistory.features.df[dfValue] || 0) + 1;
+                    userHistory.total.df = (userHistory.total.df || 0) + 1; // 累加总次数
                 }
             }
             
