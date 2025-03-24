@@ -27,7 +27,7 @@ function generateRandomRTT() {
 
 module.exports = async (req, res, next) => {
   console.log('====== 进入风险检查中间件 ======');
-  
+
   // 仅在登录路由执行
   if (req.path !== '/login') {
     console.log('[跳过] 非 /login 请求');
@@ -80,36 +80,37 @@ module.exports = async (req, res, next) => {
       // 添加日志记录条件判断
       if (!req.headers['x-risk-logged']) { // 新增唯一标识检查
         await historyStore.logRiskEvent({
-            user_id: req.user.id,
-            ip_address: req.clientInfo.ip,
-            user_agent: req.clientInfo.userAgent,
-            geo_data: riskEngine.parseIP(req.clientInfo.ip),
-            risk_score: riskScore
+          user_id: req.user.id,
+          ip_address: req.clientInfo.ip,
+          user_agent: req.clientInfo.userAgent,
+          rtt: req.rtt,
+          geo_data: riskEngine.parseIP(req.clientInfo.ip),
+          risk_score: riskScore
         });
         req.headers['x-risk-logged'] = 'true'; // 标记已记录
       }
-  } catch (err) {
+    } catch (err) {
       console.error('[风险日志记录失败]', err);
-  }
+    }
 
     console.log(`风险评分结果: ${riskScore}, 处置动作: ${action}`);
 
     if (action === 'REJECT') {
-        console.log(`[阻断] 高风险访问 (分数: ${riskScore})`);
-        return res.status(403).json({ 
-            error: '高风险访问', 
-            score: parseFloat(riskScore), // 转为数字类型
-            action: action 
-        });
+      console.log(`[阻断] 高风险访问 (分数: ${riskScore})`);
+      return res.status(403).json({
+        error: '高风险访问',
+        score: parseFloat(riskScore), // 转为数字类型
+        action: action
+      });
     } else if (action === 'CHALLENGE') {
-        console.log(`[需要2FA] 中等风险 (分数: ${riskScore})`);
-        return res.redirect('/verify-2fa'); // 重定向到 2FA 页面
+      console.log(`[需要2FA] 中等风险 (分数: ${riskScore})`);
+      return res.redirect('/verify-2fa'); // 重定向到 2FA 页面
     }
 
     console.log(`[通过] 风险检查 (分数: ${riskScore})`);
     next();
-} catch (err) {
+  } catch (err) {
     console.error('风险评估异常:', err);
     return res.status(500).json({ error: '风险评估失败' });
-}
+  }
 };

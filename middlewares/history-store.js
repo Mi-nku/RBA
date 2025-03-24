@@ -44,14 +44,15 @@ class HistoryStore {
    * @param {number} params.risk_score - 风险评分
    * @returns {Promise<number>} 插入的记录ID
    */
-  async logRiskEvent({ user_id, ip_address, geo_data, risk_score, user_agent }) {
+  async logRiskEvent({ user_id, ip_address, geo_data, risk_score, user_agent, rtt }) {
     // 参数检查增强版
     const missingParams = [];
     const params = [
       { name: 'user_id', value: user_id },
       { name: 'ip_address', value: ip_address },
       { name: 'geo_data', value: geo_data },
-      { name: 'risk_score', value: risk_score }
+      { name: 'risk_score', value: risk_score },
+      { name: 'rtt', value: rtt }
     ];
 
     // 检查每个参数
@@ -75,9 +76,9 @@ class HistoryStore {
     try {
       const [result] = await connection.execute(
         `INSERT INTO risk_logs 
-        (user_id, ip_address, geo_data, risk_score, user_agent)
-        VALUES (?, ?, ?, ?, ?)`,
-        [user_id, ip_address, geo_data, risk_score, user_agent]
+        (user_id, ip_address, geo_data, risk_score, user_agent, rtt)
+        VALUES (?, ?, ?, ?, ?, ?)`,
+        [user_id, ip_address, geo_data, risk_score, user_agent, rtt]
       );
       return result.insertId;
     } catch (error) {
@@ -211,6 +212,15 @@ class HistoryStore {
         GROUP BY user_agent`
       ) || [];
 
+      // 新增RTT统计查询
+      const [rttStats] = await connection.execute(
+        `SELECT 
+            rtt AS feature,
+            COUNT(*) AS count
+        FROM risk_logs
+        GROUP BY rtt`
+      ) || [];
+
       // 处理UA统计数据
       const uaStats = this._processUAStats(uaRawStats);
 
@@ -241,7 +251,7 @@ class HistoryStore {
         bv: this._arrayToObject(versionsArray, 'version', 'count'),
         osv: this._arrayToObject(osVersionsArray, 'os', 'count'),
         df: this._arrayToObject(devicesArray, 'device', 'count'),
-        rtt: {} // 初始化空结构
+        rtt: this._arrayToObject(rttStats, 'feature', 'count')
       };
 
       console.debug('[全局特征统计生成]', {
@@ -569,6 +579,24 @@ class HistoryStore {
       const osvFeatures = this._arrayToObject(osVersionsArray, 'os', 'count');
       const dfFeatures = this._arrayToObject(devicesArray, 'device', 'count');
 
+
+      // 新增用户RTT统计查询
+      const [rttStatsResult] = await connection.execute(
+        `SELECT 
+            rtt AS feature,
+            COUNT(*) AS count
+        FROM risk_logs 
+        WHERE user_id = ?
+        GROUP BY rtt`,
+        [userIdForQuery]
+      );
+
+      // 处理RTT统计数据
+      const rttStats = rttStatsResult.reduce((acc, row) => {
+        acc[row.feature] = row.count;
+        return acc;
+      }, {});
+
       // 使用正确的用户ID作为缓存键
       this.users[userIdForCache] = {
         loginCount: loginCount,
@@ -579,7 +607,8 @@ class HistoryStore {
           osv: osvFeatures,
           df: dfFeatures,
           asn: asnStats,
-          cc: ccStats
+          cc: ccStats,
+          rtt: rttStats
         },
         total: {
           ip: ipStatsResult.length || 0,
@@ -589,7 +618,7 @@ class HistoryStore {
           bv: Object.keys(bvFeatures).length || 0,
           osv: Object.keys(osvFeatures).length || 0,
           df: Object.keys(dfFeatures).length || 0,
-          rtt: 0
+          rtt: rttStatsResult.length || 0
         }
       };
 
