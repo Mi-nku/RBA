@@ -83,7 +83,8 @@ module.exports = async (req, res, next) => {
           user_id: req.user.id,
           ip_address: req.clientInfo.ip,
           user_agent: req.clientInfo.userAgent,
-          rtt: req.rtt,
+          //rtt: req.rtt,
+          rtt: rttValue,
           geo_data: riskEngine.parseIP(req.clientInfo.ip),
           risk_score: riskScore
         });
