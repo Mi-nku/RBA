@@ -665,25 +665,17 @@ class RiskEngine {
             if (features.rtt !== undefined) {
                 const rttValue = features.rtt;
 
-
-
-                // 更新用户历史
+                // 确保 rtt 特征存在于 features 和 total 中
                 userHistory.features.rtt = userHistory.features.rtt || {};
+                userHistory.total.rtt = userHistory.total.rtt || 0;
+
+                // 更新用户历史中的 RTT 计数
                 userHistory.features.rtt[rttValue] = (userHistory.features.rtt[rttValue] || 0) + 1;
-                userHistory.total.rtt = (userHistory.total.rtt || 0) + 1;
+                userHistory.total.rtt += 1; // 累加 RTT 总次数
             }
-
-
-
-
-
-            console.debug(`[用户历史] 更新成功: ${userId}`, {
-                loginCount: userHistory.loginCount,
-                ipCount: Object.keys(userHistory.features.ip).length,
-                uaCount: Object.keys(userHistory.features.ua).length
-            });
         } catch (error) {
-            console.error(`[用户历史] 更新失败: ${userId}`, error);
+            console.error(`[用户历史更新失败] 用户 ${userId}:`, error);
+            // 可以在这里添加更详细的错误处理或日志记录
         }
     }
 }

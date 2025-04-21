@@ -19,7 +19,7 @@ app.use(cookieParser());
 
 // 用户数据存储路径
 const USERS_FILE = path.join(__dirname, 'users.json');
-const ADMIN_USERNAME = 'admin';
+const ADMIN_USERNAME = 'risk_user';
 
 // 导入中间件
 const { middleware: historyStoreMiddleware } = require('./middlewares/history-store');

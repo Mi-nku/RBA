@@ -18,9 +18,6 @@ module.exports = {
         }
     },
 
-
-
-    // 删除重复的risk配置，只保留一个
     risk: {
         rejectThreshold: 0.7,   // 拒绝阈值
         requestThreshold: 0.4   // 挑战阈值
@@ -53,8 +50,5 @@ module.exports = {
             ca: process.env.DB_SSL_CA // 生产环境建议添加CA证书
         } : null,
         timezone: '+00:00' // 建议明确设置时区
-    },
-    risk:{
-        rejectThreshold:2.0
     }
 };

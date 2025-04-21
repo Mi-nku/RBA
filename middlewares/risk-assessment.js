@@ -79,14 +79,16 @@ module.exports = async (req, res, next) => {
     try {
       // 添加日志记录条件判断
       if (!req.headers['x-risk-logged']) { // 新增唯一标识检查
+        // 确保解析地理位置数据
+        const geoData = riskEngine.parseIP(features.ip);
+        
         await historyStore.logRiskEvent({
           user_id: req.user.id,
-          ip_address: req.clientInfo.ip,
-          user_agent: req.clientInfo.userAgent,
-          //rtt: req.rtt,
-          rtt: rttValue,
-          geo_data: riskEngine.parseIP(req.clientInfo.ip),
-          risk_score: riskScore
+          ip_address: features.ip, // 使用 features 中的 IP
+          user_agent: features.ua, // 使用 features 中的 UA
+          rtt: features.rtt,       // 使用 features 中的 RTT
+          geo_data: geoData, // 确保传递完整的地理位置对象
+          risk_score: parseFloat(riskScore) // 确保是数字
         });
         req.headers['x-risk-logged'] = 'true'; // 标记已记录
       }

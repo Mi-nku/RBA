@@ -4,16 +4,9 @@ const config = require('../src/risk/config.js');
 
 class HistoryStore {
 
-
   constructor() {
     this.users = {}; // 显式初始化 ✅
     this.pool = mysql.createPool(config.database);
-    // 初始化连接池（复用config中的数据库配置）
-    // this.pool = mysql.createPool({
-    //   ...config.database,
-    //   namedPlaceholders: true, // 启用命名占位符
-    //   timezone: '+00:00'      // 统一使用UTC时间
-    // });
     this.cache = {
       users: {},       // 用户历史缓存
       globalStats: {   // 全局统计缓存
@@ -23,8 +16,74 @@ class HistoryStore {
       },
       lastUpdated: 0   // 最后更新时间戳
     };
-
   }
+
+  // 新增：获取总登录次数方法
+  async getTotalLoginCount() {
+    try {
+      // 首先尝试从缓存获取
+      if (Date.now() - this.cache.lastUpdated < 60000) { // 缓存1分钟
+        return this.cache.globalStats.totalLoginCount;
+      }
+
+      // 缓存过期，从数据库获取
+      const connection = await this.pool.getConnection();
+      try {
+        const [rows] = await connection.execute('SELECT COUNT(*) as total FROM risk_logs');
+        const count = rows[0]?.total || 0;
+        
+        // 更新缓存
+        this.cache.globalStats.totalLoginCount = count;
+        this.cache.lastUpdated = Date.now();
+        
+        return count;
+      } finally {
+        connection.release();
+      }
+    } catch (error) {
+      console.error('获取总登录次数失败:', error);
+      // 出错时返回缓存值或默认值
+      return this.cache.globalStats.totalLoginCount || 1;
+    }
+  }
+
+  // 新增：获取全局特征统计总数
+  async getGlobalTotalStats() {
+    try {
+      if (Date.now() - this.cache.lastUpdated < 60000) { // 缓存1分钟
+        return this.cache.globalStats.totalStats;
+      }
+
+      const connection = await this.pool.getConnection();
+      try {
+        // 查询每种特征类型的总计数
+        const [rows] = await connection.execute(`
+          SELECT feature_type, SUM(count) as total
+          FROM feature_stats 
+          WHERE user_id IS NULL
+          GROUP BY feature_type
+        `);
+
+        // 处理结果为所需格式
+        const totalStats = {};
+        rows.forEach(row => {
+          totalStats[row.feature_type] = row.total;
+        });
+
+        // 更新缓存
+        this.cache.globalStats.totalStats = totalStats;
+        this.cache.lastUpdated = Date.now();
+        
+        return totalStats;
+      } finally {
+        connection.release();
+      }
+    } catch (error) {
+      console.error('获取全局特征统计总数失败:', error);
+      return this.cache.globalStats.totalStats || {};
+    }
+  }
+
   async getGlobalFeatureStats() {
     if (Date.now() - this.cache.lastUpdated < 60000) { // 缓存1分钟
       return this.cache.globalStats.featureStats;
@@ -35,6 +94,98 @@ class HistoryStore {
     return stats;
   }
 
+  // 实现缺失的 _getGlobalFeatureStats 方法
+  async _getGlobalFeatureStats() {
+    try {
+      const connection = await this.pool.getConnection();
+      try {
+        // 查询所有全局特征统计（不包含用户特定统计）
+        const [rows] = await connection.execute(`
+          SELECT feature_type, feature_value, count
+          FROM feature_stats 
+          WHERE user_id IS NULL
+        `);
+
+        // 将结果组织为所需格式
+        const featureStats = {};
+        rows.forEach(row => {
+          if (!featureStats[row.feature_type]) {
+            featureStats[row.feature_type] = {};
+          }
+          featureStats[row.feature_type][row.feature_value] = row.count;
+        });
+
+        return featureStats;
+      } finally {
+        connection.release();
+      }
+    } catch (error) {
+      console.error('获取全局特征统计失败:', error);
+      return {};
+    }
+  }
+
+  // 新增：初始化用户历史记录的方法
+  async initializeUserHistory(userId, forceRefresh = false) {
+    try {
+      // 如果已在内存中且不强制刷新，则直接返回
+      if (this.users[userId] && !forceRefresh) {
+        return this.users[userId];
+      }
+
+      const connection = await this.pool.getConnection();
+      try {
+        // 获取用户登录次数
+        const [loginCountRows] = await connection.execute(
+          'SELECT COUNT(*) as count FROM risk_logs WHERE user_id = ?', 
+          [userId]
+        );
+        const loginCount = loginCountRows[0]?.count || 0;
+
+        // 获取用户特征统计
+        const [featureRows] = await connection.execute(`
+          SELECT feature_type, feature_value, count
+          FROM feature_stats 
+          WHERE user_id = ?
+        `, [userId]);
+
+        // 组织数据结构
+        const features = {};
+        const total = {};
+        
+        featureRows.forEach(row => {
+          if (!features[row.feature_type]) {
+            features[row.feature_type] = {};
+            total[row.feature_type] = 0;
+          }
+          features[row.feature_type][row.feature_value] = row.count;
+          total[row.feature_type] += row.count;
+        });
+
+        // 确保所有特征都被初始化
+        ['ip', 'ua', 'bv', 'osv', 'df', 'asn', 'cc', 'rtt'].forEach(featureType => {
+          if (!features[featureType]) features[featureType] = {};
+          if (!total[featureType]) total[featureType] = 0;
+        });
+
+        // 创建并存储用户历史
+        const userHistory = { 
+          loginCount, 
+          features, 
+          total 
+        };
+        
+        this.users[userId] = userHistory;
+        return userHistory;
+      } finally {
+        connection.release();
+      }
+    } catch (error) {
+      console.error(`初始化用户历史记录失败 (用户ID: ${userId}):`, error);
+      return null;
+    }
+  }
+
   /**
    * 记录风险分析结果
    * @param {Object} params - 参数对象
@@ -42,10 +193,11 @@ class HistoryStore {
    * @param {string} params.ip_address - IP地址
    * @param {Object} params.geo_data - 地理数据对象
    * @param {number} params.risk_score - 风险评分
+   * @param {string} params.user_agent - 用户代理
+   * @param {number} params.rtt - RTT 值
    * @returns {Promise<number>} 插入的记录ID
    */
   async logRiskEvent({ user_id, ip_address, geo_data, risk_score, user_agent, rtt }) {
-    // 参数检查增强版
     const missingParams = [];
     const params = [
       { name: 'user_id', value: user_id },
@@ -55,7 +207,6 @@ class HistoryStore {
       { name: 'rtt', value: rtt }
     ];
 
-    // 检查每个参数
     params.forEach(param => {
       if (!param.value) {
         missingParams.push(param.name);
@@ -67,19 +218,29 @@ class HistoryStore {
       }
     });
 
-    // 如果有缺失参数则报错
     if (missingParams.length > 0) {
       throw new Error(`缺少必需的参数: ${missingParams.join(', ')}`);
     }
 
     const connection = await this.pool.getConnection();
     try {
+      // 1. 插入风险日志
       const [result] = await connection.execute(
         `INSERT INTO risk_logs 
         (user_id, ip_address, geo_data, risk_score, user_agent, rtt)
         VALUES (?, ?, ?, ?, ?, ?)`,
-        [user_id, ip_address, geo_data, risk_score, user_agent, rtt]
+        [user_id, ip_address, JSON.stringify(geo_data), risk_score, user_agent, rtt]
       );
+
+      // 2. 更新内存缓存
+      this._updateInMemoryCache(user_id, { ip_address, geo_data, user_agent, rtt });
+
+      // 3. 新增：更新特征统计表
+      await this._updateFeatureStats(user_id, { ip_address, geo_data, user_agent, rtt });
+
+      // 4. 新增：更新用户活动摘要表
+      await this._updateUserActivitySummary(user_id, { ip_address, geo_data });
+
       return result.insertId;
     } catch (error) {
       this.handleDBError(error, '风险日志记录失败');
@@ -89,612 +250,337 @@ class HistoryStore {
     }
   }
 
-
-
-
   /**
-   * 获取用户风险历史（精确匹配用户ID和时间范围）
-   * @param {string} user_id - 用户ID
-   * @param {Object} [options] - 查询选项
-   * @param {number} [options.hours=24] - 查询时间范围（小时）
-   * @param {number} [options.limit=50] - 最大返回数量
-   * @returns {Promise<Array>} 风险日志数组
-   */
-  async getRiskHistory(user_id, { hours = 24, limit = 50 } = {}) {
-    const connection = await this.pool.getConnection();
-    try {
-      const [rows] = await connection.execute(
-        `SELECT 
-          id,
-          ip_address AS ip,
-          geo_data AS geo,
-          risk_score AS score,
-          created_at AS timestamp
-        FROM risk_logs
-        WHERE user_id = :user_id
-          AND created_at >= NOW() - INTERVAL :hours HOUR
-        ORDER BY created_at DESC
-        LIMIT :limit`,
-        { user_id, hours, limit }
-      );
-
-      return rows.map(row => ({
-        ...row,
-        geo: JSON.parse(row.geo),
-        timestamp: new Date(row.timestamp).toISOString()
-      }));
-    } catch (error) {
-      this.handleDBError(error, '风险历史查询失败');
-    } finally {
-      connection.release();
-    }
-  }
-
-  /**
-   * 错误处理统一方法
-   * @param {Error} error - 原始错误对象
-   * @param {string} message - 自定义错误信息
-   */
-  handleDBError(error, message) {
-    console.error(`[HistoryStore] ${message}:`, {
-      code: error.code,
-      sqlState: error.sqlState,
-      sqlMessage: error.sqlMessage,
-      stack: error.stack
-    });
-    throw new Error(`${message}（错误码：${error.code}）`);
-  }
-
-  /**
-   * 关闭连接池（用于优雅退出）
-   */
-  async close() {
-    await this.pool.end();
-    console.log('[HistoryStore] 数据库连接池已关闭');
-  }
-
-  /**
-  * 获取全局登录总次数
-  * @returns {Promise<number>}
-  */
-  async getTotalLoginCount() {
-    const connection = await this.pool.getConnection();
-    try {
-      const [rows] = await connection.execute(
-        'SELECT COUNT(*) AS total FROM risk_logs'
-      );
-      return rows[0].total || 0;
-    } catch (error) {
-      this.handleDBError(error, '全局登录次数查询失败');
-    } finally {
-      connection.release();
-    }
-  }
-
-  /**
-   * 获取全局特征统计
-   * @returns {Promise<Object>}
-   */
-  /**
-   * 获取全局特征统计（内部实现）
-   * @returns {Promise<Object>}
+   * 更新特征统计表
+   * @param {string} userId - 用户ID
+   * @param {Object} features - 特征对象
    * @private
    */
-  async _getGlobalFeatureStats() {
-    const connection = await this.pool.getConnection();
+  async _updateFeatureStats(userId, features) {
     try {
-      // IP统计查询
-      const [ipStats] = await connection.execute(
-        `SELECT 
-          ip_address AS feature, 
-          COUNT(*) AS count 
-        FROM risk_logs 
-        GROUP BY ip_address`
-      ) || [];
+      const connection = await this.pool.getConnection();
+      try {
+        const featuresToUpdate = [];
 
-      // 新增：ASN和CC统计查询
-      const [geoStats] = await connection.execute(
-        `SELECT 
-          JSON_EXTRACT(geo_data, '$.asn') AS asn,
-          JSON_EXTRACT(geo_data, '$.cc') AS cc,
-          COUNT(*) AS count
-        FROM risk_logs 
-        WHERE geo_data IS NOT NULL AND geo_data != '{}'
-        GROUP BY JSON_EXTRACT(geo_data, '$.asn'), JSON_EXTRACT(geo_data, '$.cc')`
-      ) || [];
+        // 1. 处理IP特征
+        if (features.ip_address) {
+          featuresToUpdate.push({
+            type: 'ip',
+            value: features.ip_address,
+            userId
+          });
+        }
 
-      // UA统计查询
-      const [uaRawStats] = await connection.execute(
-        `SELECT 
-          user_agent AS feature, 
-          COUNT(*) AS count 
-        FROM risk_logs 
-        GROUP BY user_agent`
-      ) || [];
+        // 2. 处理User-Agent相关特征
+        if (features.user_agent) {
+          const UAParser = require('ua-parser-js');
+          const parser = new UAParser(features.user_agent);
+          const browser = parser.getBrowser();
+          const os = parser.getOS();
+          const device = parser.getDevice();
 
-      // 新增RTT统计查询
-      const [rttStats] = await connection.execute(
-        `SELECT 
-            rtt AS feature,
-            COUNT(*) AS count
-        FROM risk_logs
-        GROUP BY rtt`
-      ) || [];
+          featuresToUpdate.push({
+            type: 'ua',
+            value: browser.name || 'Unknown',
+            userId
+          });
 
-      // 处理UA统计数据
-      const uaStats = this._processUAStats(uaRawStats);
+          featuresToUpdate.push({
+            type: 'bv',
+            value: this._parseVersion(browser.version) || 'Unknown',
+            userId
+          });
 
-      // 处理ASN和CC统计
-      const asnStats = {};
-      const ccStats = {};
-      geoStats.forEach(row => {
-        // 去除JSON字符串中的引号
-        const asn = row.asn ? row.asn.replace(/"/g, '') : 'Unknown';
-        const cc = row.cc ? row.cc.replace(/"/g, '') : 'XX';
+          featuresToUpdate.push({
+            type: 'osv',
+            value: os.version || 'Unknown',
+            userId
+          });
 
-        asnStats[asn] = (asnStats[asn] || 0) + row.count;
-        ccStats[cc] = (ccStats[cc] || 0) + row.count;
-      });
+          featuresToUpdate.push({
+            type: 'df',
+            value: device.model ? device.model : 'desktop',
+            userId
+          });
+        }
 
-      // 修复：将对象格式转换为数组格式
-      const browsersArray = Object.entries(uaStats.browsers || {}).map(([name, count]) => ({ name, count }));
-      const versionsArray = Object.entries(uaStats.versions || {}).map(([version, count]) => ({ version, count }));
-      const osVersionsArray = Object.entries(uaStats.osVersions || {}).map(([os, count]) => ({ os, count }));
-      const devicesArray = Object.entries(uaStats.devices || {}).map(([device, count]) => ({ device, count }));
+        // 3. 处理地理位置特征
+        if (features.geo_data) {
+          featuresToUpdate.push({
+            type: 'asn',
+            value: features.geo_data.asn || 'Unknown',
+            userId
+          });
 
-      // 构建特征统计结构
-      const featureStats = {
-        ip: this._arrayToObject(Array.isArray(ipStats) ? ipStats : [], 'feature', 'count'),
-        asn: asnStats,  // 新增ASN统计
-        cc: ccStats,    // 新增CC统计
-        ua: this._arrayToObject(browsersArray, 'name', 'count'),
-        bv: this._arrayToObject(versionsArray, 'version', 'count'),
-        osv: this._arrayToObject(osVersionsArray, 'os', 'count'),
-        df: this._arrayToObject(devicesArray, 'device', 'count'),
-        rtt: this._arrayToObject(rttStats, 'feature', 'count')
-      };
+          featuresToUpdate.push({
+            type: 'cc',
+            value: features.geo_data.cc || 'XX',
+            userId
+          });
+        }
 
-      console.debug('[全局特征统计生成]', {
-        ipCount: Object.keys(featureStats.ip).length,
-        asnCount: Object.keys(featureStats.asn).length,
-        ccCount: Object.keys(featureStats.cc).length,
-        uaCount: Object.keys(featureStats.ua).length,
-        bvCount: Object.keys(featureStats.bv).length,
-        osvCount: Object.keys(featureStats.osv).length,
-        dfCount: Object.keys(featureStats.df).length
-      });
+        // 4. 处理RTT特征
+        if (features.rtt !== undefined) {
+          featuresToUpdate.push({
+            type: 'rtt',
+            value: features.rtt.toString(),
+            userId
+          });
+        }
 
-      return featureStats;
+        // 5. 批量更新特征统计
+        for (const feature of featuresToUpdate) {
+          try {
+            // 全局统计（不指定用户）
+            await connection.execute(`
+              INSERT INTO feature_stats 
+                (feature_type, feature_value, user_id, count) 
+              VALUES (?, ?, NULL, 1)
+              ON DUPLICATE KEY UPDATE 
+                count = count + 1,
+                last_seen = CURRENT_TIMESTAMP
+            `, [feature.type, feature.value]);
+
+            // 如果有用户ID，则更新用户特定统计
+            if (feature.userId) {
+              await connection.execute(`
+                INSERT INTO feature_stats 
+                  (feature_type, feature_value, user_id, count) 
+                VALUES (?, ?, ?, 1)
+                ON DUPLICATE KEY UPDATE 
+                  count = count + 1,
+                  last_seen = CURRENT_TIMESTAMP
+              `, [feature.type, feature.value, feature.userId]);
+            }
+          } catch (err) {
+            console.error(`更新特征统计失败: ${feature.type}=${feature.value}`, err);
+          }
+        }
+      } finally {
+        connection.release();
+      }
     } catch (error) {
-      console.error('[全局特征统计失败]', error.stack);
-      // 返回完整结构兜底
-      return {
-        ip: {},
-        asn: {},  // 新增
-        cc: {},   // 新增
-        ua: {},
-        bv: {},
-        osv: {},
-        df: {},
-        rtt: {}
-      };
-    } finally {
-      connection.release();
+      console.error('更新特征统计失败:', error);
     }
   }
 
-  // 新增：处理UA统计数据的辅助方法
-  _processUAStats(uaRawStats) {
-    const UAParser = require('ua-parser-js');
-    const browsers = {};
-    const versions = {};
-    const osVersions = {};
-    const devices = {};
-
-    uaRawStats.forEach(item => {
+  /**
+   * 更新用户活动摘要表
+   * @param {string} userId - 用户ID
+   * @param {Object} features - 特征对象
+   * @private
+   */
+  async _updateUserActivitySummary(userId, features) {
+    try {
+      const connection = await this.pool.getConnection();
       try {
-        const parser = new UAParser(item.feature);
+        // 获取用户的最新统计
+        const [ipCount] = await connection.execute(`
+          SELECT COUNT(DISTINCT ip_address) as unique_ips FROM risk_logs WHERE user_id = ?
+        `, [userId]);
+
+        const [browserCount] = await connection.execute(`
+          SELECT COUNT(DISTINCT JSON_EXTRACT(JSON_EXTRACT(geo_data, '$.asn'), '$')) as unique_locations,
+                 COUNT(DISTINCT (
+                   SELECT ua.name FROM (
+                     SELECT user_agent,
+                       JSON_EXTRACT(JSON_OBJECT('name', SUBSTRING_INDEX(SUBSTRING_INDEX(user_agent, '/', 1), ' ', -1)), '$.name') as name
+                     FROM risk_logs LIMIT 1
+                   ) as ua
+                 )) as unique_browsers,
+                 COUNT(DISTINCT (
+                   CASE 
+                     WHEN user_agent LIKE '%Mobile%' THEN 'mobile'
+                     ELSE 'desktop'
+                   END
+                 )) as unique_devices
+          FROM risk_logs WHERE user_id = ?
+        `, [userId]);
+
+        const [loginCount] = await connection.execute(`
+          SELECT COUNT(*) as total FROM risk_logs WHERE user_id = ?
+        `, [userId]);
+
+        // 计算风险级别 (可以根据实际需求调整)
+        let riskLevel = 0;
+        if (ipCount[0].unique_ips > 3) riskLevel = 1;
+        if (ipCount[0].unique_ips > 5) riskLevel = 2;
+
+        // 更新摘要表
+        await connection.execute(`
+          INSERT INTO user_activity_summary 
+            (user_id, total_logins, unique_ips, unique_browsers, unique_devices, unique_locations, risk_level, last_login)
+          VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+          ON DUPLICATE KEY UPDATE 
+            total_logins = VALUES(total_logins),
+            unique_ips = VALUES(unique_ips),
+            unique_browsers = VALUES(unique_browsers),
+            unique_devices = VALUES(unique_devices),
+            unique_locations = VALUES(unique_locations),
+            risk_level = VALUES(risk_level),
+            last_login = CURRENT_TIMESTAMP
+        `, [
+          userId, 
+          loginCount[0].total, 
+          ipCount[0].unique_ips,
+          browserCount[0].unique_browsers || 0,
+          browserCount[0].unique_devices || 0,
+          browserCount[0].unique_locations || 0,
+          riskLevel
+        ]);
+      } finally {
+        connection.release();
+      }
+    } catch (error) {
+      console.error('更新用户活动摘要失败:', error);
+    }
+  }
+
+  /**
+   * 更新内存中的全局和用户缓存
+   * @param {string} userId - 用户ID
+   * @param {Object} features - 本次事件的特征 { ip_address, geo_data, user_agent, rtt }
+   * @private
+   */
+  _updateInMemoryCache(userId, features) {
+    try {
+      console.debug(`[缓存更新] 开始更新用户 ${userId} 和全局缓存`);
+
+      const globalStats = this.cache.globalStats;
+      globalStats.totalLoginCount = (globalStats.totalLoginCount || 0) + 1;
+
+      const featureStats = globalStats.featureStats;
+      const totalStats = globalStats.totalStats;
+
+      if (features.ip_address) {
+        featureStats.ip = featureStats.ip || {};
+        featureStats.ip[features.ip_address] = (featureStats.ip[features.ip_address] || 0) + 1;
+        totalStats.ip = (totalStats.ip || 0) + 1;
+      }
+
+      if (features.geo_data) {
+        const asn = features.geo_data.asn || 'Unknown';
+        const cc = features.geo_data.cc || 'XX';
+        featureStats.asn = featureStats.asn || {};
+        featureStats.cc = featureStats.cc || {};
+        featureStats.asn[asn] = (featureStats.asn[asn] || 0) + 1;
+        featureStats.cc[cc] = (featureStats.cc[cc] || 0) + 1;
+        totalStats.asn = (totalStats.asn || 0) + 1;
+        totalStats.cc = (totalStats.cc || 0) + 1;
+      }
+
+      if (features.user_agent) {
+        const UAParser = require('ua-parser-js');
+        const parser = new UAParser(features.user_agent);
         const browser = parser.getBrowser();
         const os = parser.getOS();
         const device = parser.getDevice();
 
-        // 浏览器名称统计
-        const browserName = browser.name || 'Unknown';
-        browsers[browserName] = (browsers[browserName] || 0) + item.count;
+        const uaName = browser.name || 'Unknown';
+        const bv = this._parseVersion(browser.version);
+        const osv = os.version || 'Unknown';
+        const df = device.model ? device.model : 'desktop';
 
-        // 浏览器版本统计
-        const browserVersion = this._parseVersion(browser.version);
-        versions[browserVersion] = (versions[browserVersion] || 0) + item.count;
+        featureStats.ua = featureStats.ua || {};
+        featureStats.bv = featureStats.bv || {};
+        featureStats.osv = featureStats.osv || {};
+        featureStats.df = featureStats.df || {};
 
-        // 操作系统版本统计
-        const osVersion = os.version || 'Unknown';
-        osVersions[osVersion] = (osVersions[osVersion] || 0) + item.count;
+        featureStats.ua[uaName] = (featureStats.ua[uaName] || 0) + 1;
+        featureStats.bv[bv] = (featureStats.bv[bv] || 0) + 1;
+        featureStats.osv[osv] = (featureStats.osv[osv] || 0) + 1;
+        featureStats.df[df] = (featureStats.df[df] || 0) + 1;
 
-        // 设备类型统计
-        const deviceType = device.model ? device.model : 'desktop';
-        devices[deviceType] = (devices[deviceType] || 0) + item.count;
-      } catch (e) {
-        console.error('UA解析失败:', e);
+        totalStats.ua = (totalStats.ua || 0) + 1;
+        totalStats.bv = (totalStats.bv || 0) + 1;
+        totalStats.osv = (totalStats.osv || 0) + 1;
+        totalStats.df = (totalStats.df || 0) + 1;
       }
-    });
 
-    return { browsers, versions, osVersions, devices };
+      if (features.rtt !== undefined) {
+        featureStats.rtt = featureStats.rtt || {};
+        featureStats.rtt[features.rtt] = (featureStats.rtt[features.rtt] || 0) + 1;
+        totalStats.rtt = (totalStats.rtt || 0) + 1;
+      }
+
+      // 更新用户历史记录（如果用户存在）
+      if (this.users[userId]) {
+        const userHistory = this.users[userId];
+        userHistory.loginCount = (userHistory.loginCount || 0) + 1;
+
+        // 确保用户特征和总数结构存在
+        userHistory.features = userHistory.features || {};
+        userHistory.total = userHistory.total || {};
+
+        if (features.ip_address) {
+          userHistory.features.ip = userHistory.features.ip || {};
+          userHistory.features.ip[features.ip_address] = (userHistory.features.ip[features.ip_address] || 0) + 1;
+          userHistory.total.ip = (userHistory.total.ip || 0) + 1;
+        }
+
+        if (features.geo_data) {
+          const asn = features.geo_data.asn || 'Unknown';
+          const cc = features.geo_data.cc || 'XX';
+          userHistory.features.asn = userHistory.features.asn || {};
+          userHistory.features.cc = userHistory.features.cc || {};
+          userHistory.features.asn[asn] = (userHistory.features.asn[asn] || 0) + 1;
+          userHistory.features.cc[cc] = (userHistory.features.cc[cc] || 0) + 1;
+          userHistory.total.asn = (userHistory.total.asn || 0) + 1;
+          userHistory.total.cc = (userHistory.total.cc || 0) + 1;
+        }
+
+        if (features.user_agent) {
+          const UAParser = require('ua-parser-js');
+          const parser = new UAParser(features.user_agent);
+          const browser = parser.getBrowser();
+          const os = parser.getOS();
+          const device = parser.getDevice();
+
+          const uaName = browser.name || 'Unknown';
+          const bv = this._parseVersion(browser.version);
+          const osv = os.version || 'Unknown';
+          const df = device.model ? device.model : 'desktop';
+
+          userHistory.features.ua = userHistory.features.ua || {};
+          userHistory.features.bv = userHistory.features.bv || {};
+          userHistory.features.osv = userHistory.features.osv || {};
+          userHistory.features.df = userHistory.features.df || {};
+
+          userHistory.features.ua[uaName] = (userHistory.features.ua[uaName] || 0) + 1;
+          userHistory.features.bv[bv] = (userHistory.features.bv[bv] || 0) + 1;
+          userHistory.features.osv[osv] = (userHistory.features.osv[osv] || 0) + 1;
+          userHistory.features.df[df] = (userHistory.features.df[df] || 0) + 1;
+
+          userHistory.total.ua = (userHistory.total.ua || 0) + 1;
+          userHistory.total.bv = (userHistory.total.bv || 0) + 1;
+          userHistory.total.osv = (userHistory.total.osv || 0) + 1;
+          userHistory.total.df = (userHistory.total.df || 0) + 1;
+        }
+
+        if (features.rtt !== undefined) {
+          userHistory.features.rtt = userHistory.features.rtt || {};
+          userHistory.features.rtt[features.rtt] = (userHistory.features.rtt[features.rtt] || 0) + 1;
+          userHistory.total.rtt = (userHistory.total.rtt || 0) + 1;
+        }
+      } else {
+        console.debug(`[缓存更新] 用户 ${userId} 不在缓存中，将在下次请求时初始化`);
+      }
+
+      console.debug(`[缓存更新] 完成`);
+    } catch (error) {
+      console.error(`[缓存更新失败] 用户 ${userId}:`, error);
+    }
   }
 
-  // 辅助方法：解析版本号
   _parseVersion(version) {
     if (!version) return '0.0.0';
     return version.split('.').slice(0, 3).join('.');
   }
 
-  // 辅助方法：将数组转换为对象
-  _arrayToObject(array, keyField, valueField) {
-    const result = {};
-
-    // 添加类型检查，确保 array 是数组
-    if (!Array.isArray(array)) {
-      console.warn('[HistoryStore] _arrayToObject 接收到非数组参数:', {
-        type: typeof array,
-        value: array
-      });
-      return result; // 返回空对象
-    }
-
-    array.forEach(item => {
-      result[item[keyField]] = item[valueField];
-    });
-    return result;
-  }
-
-  /**
-   * 获取全局总计数
-   * @param {boolean} forceRefresh 是否强制刷新缓存
-   * @returns {Promise<Object>}
-   */
-  async getGlobalTotalStats(forceRefresh = false) {
-    // 检查缓存
-    if (!forceRefresh &&
-      Date.now() - this.cache.lastUpdated < 60000 &&
-      Object.keys(this.cache.globalStats.totalStats).length > 0) {
-      return this.cache.globalStats.totalStats;
-    }
-
-    const connection = await this.pool.getConnection();
-    try {
-      // 获取总记录数
-      const [total] = await connection.execute(
-        `SELECT COUNT(*) AS total_records FROM risk_logs`
-      );
-
-      const totalRecords = total[0].total_records || 0;
-
-      // 构建总计数对象 - 所有特征使用相同的总记录数
-      const totalStats = {
-        ip: totalRecords,
-        ua: totalRecords,
-        asn: totalRecords,
-        cc: totalRecords,
-        bv: totalRecords,
-        osv: totalRecords,
-        df: totalRecords,
-        rtt: totalRecords
-      };
-
-      // 更新缓存
-      this.cache.globalStats.totalStats = totalStats;
-      this.cache.lastUpdated = Date.now();
-
-      return totalStats;
-    } catch (error) {
-      this.handleDBError(error, '全局总计数查询失败');
-      return {};
-    } finally {
-      connection.release();
-    }
-  }
-  /**
-  * 获取UA相关子特征的不同值数量
-  * @returns {Promise<Object>}
-  * @private
-  */
-  async _getUADistinctCounts() {
-    const connection = await this.pool.getConnection();
-    try {
-      const [uaRawStats] = await connection.execute(
-        `SELECT user_agent FROM risk_logs`
-      );
-
-      const UAParser = require('ua-parser-js');
-      const versions = new Set();
-      const osVersions = new Set();
-      const devices = new Set();
-
-      uaRawStats.forEach(row => {
-        try {
-          const parser = new UAParser(row.user_agent);
-          const browser = parser.getBrowser();
-          const os = parser.getOS();
-          const device = parser.getDevice();
-
-          // 收集不同的浏览器版本
-          if (browser.version) {
-            versions.add(this._parseVersion(browser.version));
-          }
-
-          // 收集不同的操作系统版本
-          if (os.version) {
-            osVersions.add(os.version);
-          }
-
-          // 收集不同的设备类型
-          const deviceType = device.model ? device.model : 'desktop';
-          devices.add(deviceType);
-        } catch (e) {
-          console.error('UA解析失败:', e);
-        }
-      });
-
-      return {
-        bv: versions.size,
-        osv: osVersions.size,
-        df: devices.size
-      };
-    } catch (error) {
-      console.error('获取UA特征统计失败:', error);
-      return { bv: 0, osv: 0, df: 0 };
-    } finally {
-      connection.release();
-    }
-  }
-  /**
-   * 初始化用户历史
-   * @param {string} userId 用户ID或用户名
-   * @param {boolean} forceRefresh 是否强制刷新缓存
-   * @returns {Promise<Object>} 用户历史数据
-   */
-  async initializeUserHistory(userId, forceRefresh = false) {
-    if (!userId) return null;
-
-    // 如果已经在缓存中且不需要强制刷新，直接返回
-    if (this.users[userId] && !forceRefresh) {
-      console.log(`[HistoryStore] 用户历史已在缓存中: ${userId}`);
-      return this.users[userId];
-    }
-
-    console.log(`[HistoryStore] 从数据库加载用户历史: ${userId}`);
-    const connection = await this.pool.getConnection();
-    try {
-      // 检查是否为用户名而非用户ID
-      let userIdForQuery = userId;
-      let userIdForCache = userId;
-
-      // 尝试从users.json文件中查找用户ID
-      try {
-        const fs = require('fs');
-        const usersData = JSON.parse(fs.readFileSync('d:/RBA/rba/users.json', 'utf8'));
-
-        // 如果输入的是用户名，查找对应的用户ID
-        if (isNaN(userId) || userId.length < 10) {
-          const user = usersData.find(u => u.username === userId);
-          if (user && user.id) {
-            userIdForQuery = user.id;
-            console.log(`[HistoryStore] 用户名 ${userId} 映射到用户ID: ${userIdForQuery}`);
-            userIdForCache = userIdForQuery; // 使用用户ID作为缓存键
-          }
-        }
-        // 如果输入的是用户ID，也记录用户名用于日志
-        else {
-          const user = usersData.find(u => u.id === userId);
-          if (user && user.username) {
-            console.log(`[HistoryStore] 用户ID ${userId} 对应用户名: ${user.username}`);
-          }
-        }
-      } catch (err) {
-        console.error('[HistoryStore] 读取users.json失败:', err);
-        // 继续使用原始userId
-      }
-
-      // 获取登录次数
-      const [loginCountResult] = await connection.execute(
-        `SELECT COUNT(*) AS loginCount 
-        FROM risk_logs 
-        WHERE user_id = ?`,
-        [userIdForQuery]
-      );
-
-      const loginCount = loginCountResult[0].loginCount || 0;
-      console.log(`[HistoryStore] 用户 ${userIdForQuery} 登录次数: ${loginCount}`);
-
-      // 获取IP统计
-      const [ipStatsResult] = await connection.execute(
-        `SELECT 
-          ip_address AS ip,
-          COUNT(*) AS count
-        FROM risk_logs 
-        WHERE user_id = ?
-        GROUP BY ip_address`,
-        [userIdForQuery]
-      );
-
-      // 获取UA统计
-      const [uaStatsResult] = await connection.execute(
-        `SELECT 
-          user_agent AS ua,
-          COUNT(*) AS count
-        FROM risk_logs 
-        WHERE user_id = ?
-        GROUP BY user_agent`,
-        [userIdForQuery]
-      );
-
-      // 获取地理位置数据统计
-      const [geoStatsResult] = await connection.execute(
-        `SELECT 
-          JSON_EXTRACT(geo_data, '$.asn') AS asn,
-          JSON_EXTRACT(geo_data, '$.cc') AS cc,
-          COUNT(*) AS count
-        FROM risk_logs 
-        WHERE user_id = ? AND geo_data IS NOT NULL AND geo_data != '{}'
-        GROUP BY JSON_EXTRACT(geo_data, '$.asn'), JSON_EXTRACT(geo_data, '$.cc')`,
-        [userIdForQuery]
-      );
-
-      console.log(`[HistoryStore] 用户 ${userIdForQuery} 统计结果:`, {
-        ipCount: ipStatsResult.length,
-        uaCount: uaStatsResult.length,
-        geoCount: geoStatsResult.length
-      });
-
-      // 转换为需要的结构
-      const ipStats = ipStatsResult.reduce((acc, row) => {
-        acc[row.ip] = row.count;
-        return acc;
-      }, {});
-
-      // 处理UA统计 - 修复：确保UA数据正确转换
-      const uaRawStats = uaStatsResult.map(row => ({ feature: row.ua, count: row.count }));
-      const uaStats = this._processUAStats(uaRawStats);
-
-      // 修复：将对象格式转换为数组格式，以便_arrayToObject方法可以正确处理
-      const browsersArray = Object.entries(uaStats.browsers || {}).map(([name, count]) => ({ name, count }));
-      const versionsArray = Object.entries(uaStats.versions || {}).map(([version, count]) => ({ version, count }));
-      const osVersionsArray = Object.entries(uaStats.osVersions || {}).map(([os, count]) => ({ os, count }));
-      const devicesArray = Object.entries(uaStats.devices || {}).map(([device, count]) => ({ device, count }));
-
-      // 处理地理位置统计
-      const asnStats = {};
-      const ccStats = {};
-      geoStatsResult.forEach(row => {
-        // 去除JSON字符串中的引号
-        const asn = row.asn ? row.asn.replace(/"/g, '') : 'Unknown';
-        const cc = row.cc ? row.cc.replace(/"/g, '') : 'XX';
-
-        asnStats[asn] = (asnStats[asn] || 0) + row.count;
-        ccStats[cc] = (ccStats[cc] || 0) + row.count;
-      });
-
-      // 构建UA相关特征对象 - 使用转换后的数组
-      const uaFeatures = this._arrayToObject(browsersArray, 'name', 'count');
-      const bvFeatures = this._arrayToObject(versionsArray, 'version', 'count');
-      const osvFeatures = this._arrayToObject(osVersionsArray, 'os', 'count');
-      const dfFeatures = this._arrayToObject(devicesArray, 'device', 'count');
-
-
-      // 新增用户RTT统计查询
-      const [rttStatsResult] = await connection.execute(
-        `SELECT 
-            rtt AS feature,
-            COUNT(*) AS count
-        FROM risk_logs 
-        WHERE user_id = ?
-        GROUP BY rtt`,
-        [userIdForQuery]
-      );
-
-      // 处理RTT统计数据
-      const rttStats = rttStatsResult.reduce((acc, row) => {
-        acc[row.feature] = row.count;
-        return acc;
-      }, {});
-
-      // 使用正确的用户ID作为缓存键
-      this.users[userIdForCache] = {
-        loginCount: loginCount,
-        features: {
-          ip: ipStats,
-          ua: uaFeatures,
-          bv: bvFeatures,
-          osv: osvFeatures,
-          df: dfFeatures,
-          asn: asnStats,
-          cc: ccStats,
-          rtt: rttStats
-        },
-        total: {
-          ip: ipStatsResult.length || 0,
-          ua: uaStatsResult.length || 0,
-          asn: Object.keys(asnStats).length || 0,
-          cc: Object.keys(ccStats).length || 0,
-          bv: Object.keys(bvFeatures).length || 0,
-          osv: Object.keys(osvFeatures).length || 0,
-          df: Object.keys(dfFeatures).length || 0,
-          rtt: rttStatsResult.length || 0
-        }
-      };
-
-      // 同时在用户名和用户ID下都缓存相同的数据（如果它们不同）
-      if (userId !== userIdForCache) {
-        this.users[userId] = this.users[userIdForCache];
-      }
-
-      console.log(`[HistoryStore] 用户历史加载成功: ${userIdForCache}`, {
-        loginCount: this.users[userIdForCache].loginCount,
-        ipCount: Object.keys(this.users[userIdForCache].features.ip).length,
-        uaCount: Object.keys(this.users[userIdForCache].features.ua).length,
-        asnCount: Object.keys(this.users[userIdForCache].features.asn).length,
-        ccCount: Object.keys(this.users[userIdForCache].features.cc).length
-      });
-
-      return this.users[userIdForCache];
-    } catch (error) {
-      console.error(`[HistoryStore] 用户历史初始化失败: ${userId}`, error);
-      // 返回默认结构，防止后续代码出错
-      this.users[userId] = {
-        loginCount: 0,
-        features: { ip: {}, ua: {}, bv: {}, osv: {}, df: {}, asn: {}, cc: {} },
-        total: { ip: 0, ua: 0, asn: 0, cc: 0, bv: 0, osv: 0, df: 0, rtt: 0 }
-      };
-      return this.users[userId];
-    } finally {
-      connection.release();
-    }
-  }
-
-  /**
-   * 清除用户缓存
-   * @param {string} userId - 可选，特定用户ID。如果不提供，则清除所有用户缓存
-   */
-  clearUserCache(userId = null) {
-    if (userId) {
-      delete this.users[userId];
-      console.log(`[HistoryStore] 已清除用户缓存: ${userId}`);
-    } else {
-      this.users = {};
-      console.log('[HistoryStore] 已清除所有用户缓存');
-    }
-  }
-
-  /**
-   * 清除全局统计缓存
-   */
-  clearGlobalCache() {
-    this.cache.globalStats = {
-      totalLoginCount: 0,
-      featureStats: {},
-      totalStats: {}
-    };
-    this.cache.lastUpdated = 0;
-    console.log('[HistoryStore] 已清除全局统计缓存');
-  }
-
-  /**
-   * 强制刷新所有缓存
-   * @returns {Promise<void>}
-   */
-  async refreshAllCaches() {
-    console.log('[HistoryStore] 开始强制刷新所有缓存');
-    this.clearGlobalCache();
-    this.clearUserCache();
-
-    // 重新加载全局统计
-    await this.getTotalLoginCount();
-    await this.getGlobalFeatureStats();
-    await this.getGlobalTotalStats(true);
-
-    console.log('[HistoryStore] 所有缓存刷新完成');
+  handleDBError(error, message) {
+    console.error(`[数据库错误] ${message}:`, error);
   }
 }
-
 
 // 创建单例实例（供中间件使用）
 const historyStoreInstance = new HistoryStore();
@@ -705,7 +591,6 @@ module.exports = {
   middleware: (req, res, next) => {
     req.historyStore = historyStoreInstance;
     if (req.path === '/login' && req.method === 'POST') {
-      // 强制刷新用户历史
       const userId = req.body?.username || req.user?.id;
       if (userId) {
         historyStoreInstance.initializeUserHistory(userId, true)
