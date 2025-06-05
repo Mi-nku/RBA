@@ -74,7 +74,7 @@ module.exports = async (req, res, next) => {
     const riskResult = await riskEngine.calculate(req.user.id, features); // 返回对象 { score: number, action: string }
 
     // 正确提取风险评分
-    const riskScore = riskResult.score.toFixed(4); // 格式化为4位小数
+    const riskScore = (riskResult?.score ?? 1.0).toFixed(4); // 添加空值校验和默认值
     const action = riskResult.action;
     try {
       // 添加日志记录条件判断

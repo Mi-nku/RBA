@@ -461,7 +461,13 @@ the configured max_user_history_size.
 
     def p_0(self, c, N, M, smoothing=True):
         if c > 0:
+            # 当特征值出现次数大于0时，计算概率
+            # 公式: P = (c/N) * (1 - M/(N+M))
+            # 其中: c是特征值出现次数，N是总出现次数，M是平滑参数
             return 1 * c / N * (1 - (M / (N + M)))
         else:
+            # 当特征值未出现过时，使用平滑处理或返回0
+            # 平滑处理: 1/(N+M)
+            # 非平滑模式: 返回0
             return 1 / (N + M) if smoothing else 0.0
 

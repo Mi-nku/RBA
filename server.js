@@ -92,9 +92,7 @@ app.use((req, res, next) => {
 
 // 初始化用户文件
 function initUsersFile() {
-    try {
-        fs.accessSync(USERS_FILE);
-    } catch (error) {
+    if (!fs.existsSync(USERS_FILE)) {
         fs.writeFileSync(USERS_FILE, '[]', { encoding: 'utf8' });
     }
 }

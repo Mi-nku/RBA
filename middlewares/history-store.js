@@ -78,10 +78,25 @@ class HistoryStore {
         `INSERT INTO risk_logs 
         (user_id, ip_address, geo_data, risk_score, user_agent, rtt)
         VALUES (?, ?, ?, ?, ?, ?)`,
-        [user_id, ip_address, geo_data, risk_score, user_agent, rtt]
+        [user_id, ip_address, JSON.stringify(geo_data), risk_score, user_agent, rtt]
       );
       return result.insertId;
     } catch (error) {
+      const transactionId = require('uuid').v4();
+      const timestamp = new Date().toISOString();
+      console.error(JSON.stringify({
+        eventType: "DB_INSERT_ERROR",
+        transactionId,
+        timestamp,
+        params: { user_id, ip_address, geo_data: geo_data ? '***' : null, risk_score, user_agent, rtt },
+        error: {
+          code: error.code,
+          sqlState: error.sqlState,
+          sqlMessage: error.sqlMessage.replace(/\d+/g, '?')
+        },
+        stack: error.stack,
+        sql: `INSERT INTO risk_logs (user_id, ip_address, geo_data, risk_score, user_agent, rtt) VALUES (?, ?, ?, ?, ?, ?)`
+      }, null, 2));
       this.handleDBError(error, '风险日志记录失败');
       throw error; // 确保错误被正确传播
     } finally {
@@ -119,10 +134,10 @@ class HistoryStore {
       );
 
       return rows.map(row => ({
-        ...row,
-        geo: JSON.parse(row.geo),
-        timestamp: new Date(row.timestamp).toISOString()
-      }));
+          ...row,
+          geo: row.geo ? JSON.parse(row.geo) : null,
+          timestamp: new Date(row.timestamp).toISOString()
+        }));
     } catch (error) {
       this.handleDBError(error, '风险历史查询失败');
     } finally {
@@ -229,8 +244,12 @@ class HistoryStore {
       const ccStats = {};
       geoStats.forEach(row => {
         // 去除JSON字符串中的引号
-        const asn = row.asn ? row.asn.replace(/"/g, '') : 'Unknown';
-        const cc = row.cc ? row.cc.replace(/"/g, '') : 'XX';
+        // 双重类型保护：先转为字符串再处理引号
+        // 统一的安全处理方式
+        const asn = String(row.asn ?? '').replace(/\"/g, '') || 'Unknown';
+        const ccValue = String(row.cc ?? '').replace(/\"/g, '').trim();
+        const cc = ccValue || 'XX';
+        console.debug('[地理数据处理]', { rawAsn: row.asn, rawCc: row.cc, processed: { asn, cc } });
 
         asnStats[asn] = (asnStats[asn] || 0) + row.count;
         ccStats[cc] = (ccStats[cc] || 0) + row.count;
@@ -471,7 +490,7 @@ class HistoryStore {
       // 尝试从users.json文件中查找用户ID
       try {
         const fs = require('fs');
-        const usersData = JSON.parse(fs.readFileSync('d:/RBA/rba/users.json', 'utf8'));
+        const usersData = JSON.parse(fs.readFileSync('users.json', 'utf8'));
 
         // 如果输入的是用户名，查找对应的用户ID
         if (isNaN(userId) || userId.length < 10) {
@@ -565,9 +584,10 @@ class HistoryStore {
       const asnStats = {};
       const ccStats = {};
       geoStatsResult.forEach(row => {
-        // 去除JSON字符串中的引号
-        const asn = row.asn ? row.asn.replace(/"/g, '') : 'Unknown';
-        const cc = row.cc ? row.cc.replace(/"/g, '') : 'XX';
+        // 安全处理可能为null或非字符串的值
+        // 双重类型保护和空值处理
+        const asn = String(row.asn ?? '').replace(/\"/g, '') || 'Unknown';
+        const cc = String(row.cc ?? '').replace(/\"/g, '') || 'XX';
 
         asnStats[asn] = (asnStats[asn] || 0) + row.count;
         ccStats[cc] = (ccStats[cc] || 0) + row.count;

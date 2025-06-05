@@ -8,7 +8,7 @@ const cookieParser = require('cookie-parser');
 
 
 // 用户数据存储路径
-const USERS_FILE = 'D:\\RBA\\rba\\users.json';
+const USERS_FILE = 'users.json';
 const ADMIN_USERNAME = 'admin';
 
 // auth-middleware.js

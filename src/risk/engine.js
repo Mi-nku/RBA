@@ -24,7 +24,7 @@ class RiskEngine {
         }
 
         this.history = historyStore;
-        this.maliciousNetworks = [];
+        this.maliciousNetworks = ['AS12345', 'AS67890']; // 高风险ASN列表
 
         // 最终验证结果
         if (
@@ -50,7 +50,7 @@ class RiskEngine {
      */
     _smooth(count, total) {
         if (total === 0) return 0.5;
-        const alpha = config.smoothingAlpha || 1;
+        const alpha = 1; // 严格使用Python版本拉普拉斯平滑参数
         return (count + alpha) / (total + alpha * 2);
     }
 
@@ -68,238 +68,6 @@ class RiskEngine {
     }
 
 
-
-
-
-
-
-    async calculate(userId, features) {
-        let geoData = null;
-        let score = 1.0;
-        const { globalHistory, userHistory } = await this._getHistories(userId);
-
-        // 新增：记录当前登录特征，用于后续更新用户历史
-        const currentFeatures = {};
-
-        // 新增调试日志头
-        console.debug(`[风险计算] 用户 ${userId} 开始风险评估`, {
-            globalLoginCount: globalHistory.loginCount,
-            userLoginCount: userHistory.loginCount
-        });
-
-        // 遍历所有主特征
-        for (const mainFeature of Object.keys(config.coefficients)) {
-            const featureValue = this._parseFeature(mainFeature, features);
-
-            // 新增：记录当前特征值
-            currentFeatures[mainFeature] = featureValue;
-
-            console.debug(`[特征处理] 主特征 ${mainFeature} 解析结果:`, JSON.stringify(featureValue));
-
-            // ===================== 攻击者概率 p_A_given_xk =====================
-            let pA = 1.0;
-            // 新增：针对rtt特征的特殊处理
-            if (mainFeature === 'rtt') {
-                // rtt没有子特征，直接使用主特征值
-                const rttValue = featureValue;
-                pA = rttValue > 1000 ? 0.8 : 0.1; // 根据延迟时间判断风险
-
-                // 新增调试日志
-                console.debug(`[RTT特征]`, {
-                    rawValue: featureValue,
-                    parsedValue: rttValue,
-                    pA: pA.toFixed(4)
-                });
-            }
-            else {
-                for (const [subFeature, weight] of Object.entries(config.coefficients[mainFeature])) {
-                    const subValue = this._parseSubFeature(subFeature, featureValue);
-
-                    // 子特征攻击概率判断
-                    let subRisk;
-                    switch (subFeature) {
-                        case 'asn':
-                            subRisk = subValue === 'Local' ? 0.01 :
-                                this.maliciousNetworks.includes(subValue) ? 0.9 : 0.1;
-                            break;
-                        case 'cc':
-                            subRisk = subValue === 'LOCAL' ? 0.01 :
-                                config.maliciousCountries.includes(subValue) ? 0.8 : 0.2;
-                            break;
-                        case 'bv':
-                            const minVersion = config.minBrowserVersion[featureValue.ua] || 70;
-                            subRisk = parseInt(subValue) < minVersion ? 0.7 : 0.1;
-                            break;
-                        default:
-                            subRisk = 0.5;
-                    }
-                    pA *= subRisk; // 各子特征攻击概率相乘
-
-                    // 新增子特征日志
-                    console.debug(`[攻击者概率] 特征 ${mainFeature}.${subFeature}`, {
-                        subValue: subValue.toString(),
-                        subRisk: subRisk.toFixed(2),
-                        currentPA: pA.toFixed(4)
-                    });
-                }
-            }
-
-            // ===================== 全局概率 p_xk =====================
-            let pXk = 1.0;
-            if (mainFeature === 'rtt') {
-                // rtt直接使用主特征统计
-                const globalCount = globalHistory.features[mainFeature]?.[featureValue] || 0;
-                const globalTotal = globalHistory.total[mainFeature] || 1;
-                pXk = this._smooth(globalCount, globalTotal);
-                // 新增调试日志
-                console.debug(`[RTT全局统计]`, {
-                    rawValue: featureValue,
-                    count: globalCount,
-                    total: globalTotal,
-                    pXk: pXk.toFixed(4)
-
-                });
-            } else {
-                for (const [subFeature, weight] of Object.entries(config.coefficients[mainFeature])) {
-                    const subValue = this._parseSubFeature(subFeature, featureValue);
-                    const globalCount = globalHistory.features[subFeature]?.[subValue] || 0;
-                    const globalTotal = globalHistory.total[subFeature] || 1;
-                    const pHistory = this._smooth(globalCount, globalTotal);
-                    pXk *= pHistory; // 各子特征全局概率相乘
-
-                    // 新增全局概率日志
-                    console.debug(`[全局概率] 特征 ${mainFeature}.${subFeature}`, {
-                        subValue: subValue.toString(),
-                        globalCount,
-                        globalTotal,
-                        pHistory: pHistory.toFixed(4),
-                        currentPXk: pXk.toFixed(4)
-                    });
-                }
-            }
-
-            // ===================== 用户本地概率 p_xk_given_u_L =====================
-            let pXkL = 1.0;
-            if (mainFeature === 'rtt') {
-                // rtt直接使用用户历史统计
-                const userCount = userHistory.features[mainFeature]?.[featureValue] || 0;
-                const userTotal = userHistory.total[mainFeature] || 0;
-                pXkL = this._smooth(userCount, userTotal);
-                // 新增用户统计日志
-                console.debug(`[RTT用户统计]`, {
-                    rawValue: featureValue,
-                    count: userCount,
-                    total: userTotal,
-                    pXkL: pXkL.toFixed(4)
-                });
-            } else {
-                for (const [subFeature, weight] of Object.entries(config.coefficients[mainFeature])) {
-                    const subValue = this._parseSubFeature(subFeature, featureValue);
-
-                    // 使用新的用户概率计算方法
-                    const userProb = this._calculateUserProbability(subFeature, subValue, userHistory);
-
-                    // 安全检查
-                    if (userProb > 1.0) {
-                        console.warn(`[警告] 用户概率异常: ${userProb.toFixed(4)}，已修正为1.0`);
-                        userProb = 1.0;
-                    }
-
-                    pXkL *= userProb; // 各子特征用户概率相乘
-
-                    // 新增用户概率日志
-                    console.debug(`[用户概率] 特征 ${mainFeature}.${subFeature}`, {
-                        subValue: subValue.toString(),
-                        userCount: userHistory.features[subFeature]?.[subValue] || 0,
-                        userTotal: userHistory.total[subFeature] || 0,
-                        userProb: userProb.toFixed(4),
-                        currentPXkL: pXkL.toFixed(4)
-                    });
-                }
-            }
-
-            // ===================== 特征贡献值 =====================
-            const beforeScore = score;
-            // 在特征贡献值计算中添加保护措施
-            score *= (pA * pXk) / Math.max(pXkL, 0.01);  // 确保分母至少为0.01
-
-            // 在特征贡献值计算中添加最小值保护
-            if (score < 0.0001) {
-                console.warn(`[警告] 风险分数过小: ${score.toExponential(4)}，已调整为最小值`);
-                score = 0.0001;  // 防止数值下溢
-            }
-
-            console.debug(`[特征贡献] ${mainFeature}`, {
-                pA: pA.toFixed(4),
-                pXk: pXk.toFixed(4),
-                pXkL: pXkL.toFixed(4),
-                contribution: (score / beforeScore).toFixed(4),
-                newScore: score.toFixed(4)
-            });
-        }
-
-        // ===================== 全局用户比例调整 p_u_given_A / p_u_given_L =====================
-        const totalUsers = Object.keys(this.history.users).length || 1;
-        const pUGivenA = 1 / totalUsers; // 攻击者中该用户的概率
-        const pUGivenL = userHistory.loginCount / globalHistory.loginCount || 0.01; // 正常用户中该用户的活跃度
-
-        // 新增比例调整日志
-        console.debug(`[比例调整] 用户 ${userId}`, {
-            totalUsers,
-            pUGivenA: pUGivenA.toExponential(2),
-            pUGivenL: pUGivenL.toExponential(2),
-            ratio: (pUGivenA / pUGivenL).toExponential(2)
-        });
-
-        // 计算最终分数
-        let finalScore = Number(score * (pUGivenA / Math.max(pUGivenL, 0.001)));
-        if (isNaN(finalScore)) {
-            console.error('风险评估异常: 最终分数为 NaN', { score, pUGivenA, pUGivenL });
-            finalScore = 1.0; // 默认安全值
-        }
-        finalScore = Math.min(finalScore, 1.0);
-        // ===================== 阈值判断 =====================
-        const rejectThreshold = config.risk.rejectThreshold || 0.7;
-        const requestThreshold = config.risk.requestThreshold || 0.4;
-        let action = 'ALLOW';
-
-        if (finalScore > rejectThreshold) {
-            action = 'REJECT';
-            console.error(`[风险拒绝] 用户 ${userId} 分数: ${finalScore.toFixed(2)}`);
-        } else if (finalScore > requestThreshold) {
-            action = 'CHALLENGE';
-            console.warn(`[需要验证] 用户 ${userId} 分数: ${finalScore.toFixed(2)}`);
-        }
-
-        // // ===================== 保存完整日志 =====================
-        // await query(
-        //     `INSERT INTO risk_logs 
-        //     (user_id, ip_address, user_agent, geo_data, risk_score, action) 
-        //     VALUES (?, ?, ?, ?, ?, ?)`,
-        //     [
-        //         userId,
-        //         features.ip || '0.0.0.0', // 处理 ip 缺失
-        //         features.userAgent || 'Unknown',
-        //         JSON.stringify(geoData || {}), // 处理 geoData 未定义
-        //         finalScore,
-        //         action
-        //     ]
-        // );
-
-        // 新增：更新用户历史记录
-        await this._updateUserHistory(userId, currentFeatures, userHistory);
-
-        return {
-            score: finalScore,
-            action: action
-        };
-    }
-
-
-
-
-
-
     // 风险历史查询
     async getUserRiskHistory(userId) {
         return query(
@@ -310,6 +78,7 @@ class RiskEngine {
             [userId]
         );
     }
+
     /**
      * 计算用户本地概率 - 参考core.py中的p_xk_given_u_L方法
      */
@@ -411,47 +180,60 @@ class RiskEngine {
     }
 
     _calcGlobalProb(feature, value, history) {
-        // 解析特征路径
+        // 重构概率计算逻辑与core.py的p_k方法一致
         const [mainFeature, subFeature] = feature.split('.');
         let counter = 0;
-
-        // 根据特征类型正确访问计数
-        if (subFeature) {
-            // 复合特征处理
-            if (mainFeature === 'ip') {
-                if (subFeature === 'asn' || subFeature === 'cc') {
-                    // IP的ASN和CC子特征直接从对应特征中获取
-                    counter = history.features[subFeature]?.[value] || 0;
-                } else {
-                    // 其他IP子特征
-                    counter = history.features.ip?.[subFeature]?.[value] || 0;
-                }
-            } else if (mainFeature === 'ua') {
-                // UA的子特征直接从对应特征中获取
-                counter = history.features[subFeature]?.[value] || 0;
-            } else {
-                // 其他复合特征
-                counter = history.features[mainFeature]?.[subFeature]?.[value] || 0;
-            }
+        let total = 0;
+        
+        // 获取正确的特征值用于查询历史记录
+        let lookupValue;
+        if (feature === 'ip' && typeof value === 'object') {
+            lookupValue = value.ip; // 使用IP地址字符串
+        } else if (feature === 'ua' && typeof value === 'object') {
+            lookupValue = value.ua; // 使用浏览器名称字符串
+        } else if (feature === 'rtt' && typeof value === 'number') {
+            // 对RTT进行格式化，确保与历史记录中的格式一致
+            lookupValue = value.toFixed(3);
+        } else if (typeof value === 'object' && value[feature]) {
+            lookupValue = value[feature];
         } else {
-            // 简单特征
-            counter = history.features[mainFeature]?.[value] || 0;
+            lookupValue = value;
         }
 
-        // 使用正确的总计数
-        const total = history.total[subFeature || mainFeature] || 1;
+        // 检查是否为复合特征（如 ip.asn, ua.bv 等）
+        if (feature.includes('.')) {
+            const [mainFeature, subFeature] = feature.split('.');
+            if (mainFeature === 'ip') {
+                // 对于 ip.asn 和 ip.cc，total 应该从对应的 subFeature 获取
+                if (subFeature === 'asn' || subFeature === 'cc') {
+                    counter = history.globalStats.featureStats[subFeature]?.[lookupValue] || 0;
+                    total = history.globalStats.totalStats[subFeature] || 0;
+                } else {
+                    counter = history.globalStats.featureStats.ip?.[subFeature]?.[lookupValue] || 0;
+                    total = history.globalStats.totalStats.ip?.[subFeature] || 0;
+                }
+            } else if (mainFeature === 'ua') {
+                counter = history.globalStats.featureStats.ua?.[subFeature]?.[lookupValue] || 0;
+                // 修正：total 应该从扁平的 totalStats 中获取，而不是嵌套的 ua?.[subFeature]
+                total = history.globalStats.totalStats[subFeature] || 0;
+            } else { // 非复合特征，如 rtt
+                counter = history.globalStats.featureStats[feature]?.[lookupValue] || 0;
+                total = history.globalStats.totalStats[feature] || 0;
+            }
+        } else { // 单一特征，如 ip, ua, rtt
+            counter = history.globalStats.featureStats[feature]?.[lookupValue] || 0;
+            // 修正：单一特征的 total 应该直接从 totalStats 中获取
+            total = history.globalStats.totalStats[feature] || 0;
+        }
 
-        console.debug('[全局概率计算]', {
-            mainFeature,
-            subFeature,
-            value,
-            globalCount: counter,
-            globalTotal: total,
-            pHistory: this._smooth(counter, total).toFixed(4),
-            currentPXk: (this._smooth(counter, total) * (history.features[subFeature || mainFeature] ? 1 : 0)).toFixed(4)
+        console.debug(`[全局概率] 特征 ${feature} 查询:`, {
+            lookupValue,
+            counter,
+            total
         });
 
-        return this._smooth(counter, total);
+        // 使用平滑处理
+        return this._smoothProbability(counter, total);
     }
 
     /**
@@ -471,31 +253,35 @@ class RiskEngine {
         // 构建正确的全局历史结构
         const globalHistory = {
             loginCount: globalLoginCount,
-            features: globalFeatures,
-            total: globalTotals
+            globalStats: {
+                featureStats: globalFeatures,
+                totalStats: globalTotals
+            }
         };
 
         // 确保所有特征对象都存在，防止空引用错误
-        if (!globalHistory.features.ip) globalHistory.features.ip = {};
-        if (!globalHistory.features.asn) globalHistory.features.asn = {};
-        if (!globalHistory.features.cc) globalHistory.features.cc = {};
-        if (!globalHistory.features.ua) globalHistory.features.ua = {};
-        if (!globalHistory.features.bv) globalHistory.features.bv = {};
-        if (!globalHistory.features.osv) globalHistory.features.osv = {};
-        if (!globalHistory.features.df) globalHistory.features.df = {};
+        if (!globalHistory.globalStats.featureStats.ip) globalHistory.globalStats.featureStats.ip = {};
+        if (!globalHistory.globalStats.featureStats.asn) globalHistory.globalStats.featureStats.asn = {};
+        if (!globalHistory.globalStats.featureStats.cc) globalHistory.globalStats.featureStats.cc = {};
+        if (!globalHistory.globalStats.featureStats.ua) globalHistory.globalStats.featureStats.ua = {};
+        if (!globalHistory.globalStats.featureStats.bv) globalHistory.globalStats.featureStats.bv = {};
+        if (!globalHistory.globalStats.featureStats.osv) globalHistory.globalStats.featureStats.osv = {};
+        if (!globalHistory.globalStats.featureStats.df) globalHistory.globalStats.featureStats.df = {};
+        if (!globalHistory.globalStats.featureStats.rtt) globalHistory.globalStats.featureStats.rtt = {};
 
         // 调试日志：检查全局特征统计
         console.debug('[全局特征统计]', {
             loginCount: globalHistory.loginCount,
-            featureKeys: Object.keys(globalHistory.features),
-            totalKeys: Object.keys(globalHistory.total),
-            ipSampleCount: Object.keys(globalHistory.features.ip || {}).length,
-            asnSampleCount: Object.keys(globalHistory.features.asn || {}).length,
-            ccSampleCount: Object.keys(globalHistory.features.cc || {}).length,
-            uaSampleCount: Object.keys(globalHistory.features.ua || {}).length,
-            bvSampleCount: Object.keys(globalHistory.features.bv || {}).length,
-            osvSampleCount: Object.keys(globalHistory.features.osv || {}).length,
-            dfSampleCount: Object.keys(globalHistory.features.df || {}).length
+            featureKeys: Object.keys(globalHistory.globalStats.featureStats),
+            totalKeys: Object.keys(globalHistory.globalStats.totalStats),
+            ipSampleCount: Object.keys(globalHistory.globalStats.featureStats.ip || {}).length,
+            asnSampleCount: Object.keys(globalHistory.globalStats.featureStats.asn || {}).length,
+            ccSampleCount: Object.keys(globalHistory.globalStats.featureStats.cc || {}).length,
+            uaSampleCount: Object.keys(globalHistory.globalStats.featureStats.ua || {}).length,
+            bvSampleCount: Object.keys(globalHistory.globalStats.featureStats.bv || {}).length,
+            osvSampleCount: Object.keys(globalHistory.globalStats.featureStats.osv || {}).length,
+            dfSampleCount: Object.keys(globalHistory.globalStats.featureStats.df || {}).length,
+            rttSampleCount: Object.keys(globalHistory.globalStats.featureStats.rtt || {}).length // 新增RTT计数
         });
 
         // 强制从数据库获取最新的用户历史数据
@@ -505,14 +291,13 @@ class RiskEngine {
             console.warn('[风险引擎] 用户首次登录或历史记录为空', { userId });
             userHistory = {
                 loginCount: 0,
-                features: { ip: {}, ua: {}, bv: {}, osv: {}, df: {}, asn: {}, cc: {} },
+                features: { ip: {}, ua: {}, bv: {}, osv: {}, df: {}, asn: {}, cc: {}, rtt: {} },
                 total: { ip: 0, ua: 0, asn: 0, cc: 0, bv: 0, osv: 0, df: 0, rtt: 0 }
             };
             this.history.users[userId] = userHistory;
-        } else {
-            // 修复用户历史记录中的总计数
-            this._fixUserHistoryTotals(userHistory);
         }
+        // 无论是否首次登录，都尝试修复用户历史记录中的总计数，确保数据一致性
+        this._fixUserHistoryTotals(userHistory);
 
         // 调试日志：检查用户特征统计
         console.debug('[用户特征统计]', {
@@ -521,7 +306,14 @@ class RiskEngine {
             featureKeys: Object.keys(userHistory.features),
             totalKeys: Object.keys(userHistory.total),
             ipCount: Object.keys(userHistory.features.ip || {}).length,
-            uaCount: Object.keys(userHistory.features.ua || {}).length
+            uaCount: Object.keys(userHistory.features.ua || {}).length,
+            asnCount: Object.keys(userHistory.features.asn || {}).length, // 新增ASN计数
+            ccCount: Object.keys(userHistory.features.cc || {}).length,   // 新增CC计数
+            bvCount: Object.keys(userHistory.features.bv || {}).length,   // 新增BV计数
+            osvCount: Object.keys(userHistory.features.osv || {}).length, // 新增OSV计数
+            dfCount: Object.keys(userHistory.features.df || {}).length,   // 新增DF计数
+            rttCount: Object.keys(userHistory.features.rtt || {}).length, // 新增RTT计数
+            features: userHistory.features // 完整输出 features 对象
         });
 
         return {
@@ -546,6 +338,7 @@ class RiskEngine {
             userHistory.total.bv = Object.values(userHistory.features.bv || {}).reduce((sum, count) => sum + count, 0);
             userHistory.total.osv = Object.values(userHistory.features.osv || {}).reduce((sum, count) => sum + count, 0);
             userHistory.total.df = Object.values(userHistory.features.df || {}).reduce((sum, count) => sum + count, 0);
+            userHistory.total.rtt = Object.values(userHistory.features.rtt || {}).reduce((sum, count) => sum + count, 0);
 
             console.debug('[用户历史] 总计数修复完成', {
                 ip: userHistory.total.ip,
@@ -554,7 +347,8 @@ class RiskEngine {
                 osv: userHistory.total.osv,
                 df: userHistory.total.df,
                 asn: userHistory.total.asn,
-                cc: userHistory.total.cc
+                cc: userHistory.total.cc,
+                rtt: userHistory.total.rtt
             });
         } catch (error) {
             console.error('[用户历史] 总计数修复失败', error);
@@ -567,9 +361,15 @@ class RiskEngine {
 
         // 为每个主特征创建空对象
         for (const mainFeature of Object.keys(config.coefficients)) {
+            features[mainFeature] = {}; // 初始化主特征
             // 为每个子特征创建空对象
             for (const subFeature of Object.keys(config.coefficients[mainFeature])) {
-                if (!features[subFeature]) {
+                // 确保子特征的键是唯一的，并且不会覆盖主特征
+                if (mainFeature === 'ip' && (subFeature === 'asn' || subFeature === 'cc')) {
+                    features[subFeature] = {};
+                } else if (mainFeature === 'ua' && (subFeature === 'bv' || subFeature === 'osv' || subFeature === 'df')) {
+                    features[subFeature] = {};
+                } else if (mainFeature === 'rtt') {
                     features[subFeature] = {};
                 }
             }
@@ -588,7 +388,14 @@ class RiskEngine {
 
             // 为每个子特征也初始化计数为0
             for (const subFeature of Object.keys(config.coefficients[mainFeature])) {
-                totals[subFeature] = 0;
+                // 确保子特征的键是唯一的，并且不会覆盖主特征
+                if (mainFeature === 'ip' && (subFeature === 'asn' || subFeature === 'cc')) {
+                    totals[subFeature] = 0;
+                } else if (mainFeature === 'ua' && (subFeature === 'bv' || subFeature === 'osv' || subFeature === 'df')) {
+                    totals[subFeature] = 0;
+                } else if (mainFeature === 'rtt') {
+                    totals[subFeature] = 0;
+                }
             }
         }
 
@@ -608,7 +415,6 @@ class RiskEngine {
             // 增加登录次数
             userHistory.loginCount = (userHistory.loginCount || 0) + 1;
 
-
             // 更新IP特征
             if (features.ip) {
                 const ipValue = features.ip.ip;
@@ -621,12 +427,14 @@ class RiskEngine {
                 const asnValue = features.ip.asn;
                 if (asnValue) {
                     userHistory.features.asn[asnValue] = (userHistory.features.asn[asnValue] || 0) + 1;
+                    userHistory.total.asn = (userHistory.total.asn || 0) + 1; // 累加ASN总次数
                 }
 
                 // 更新国家代码特征
                 const ccValue = features.ip.cc;
                 if (ccValue) {
                     userHistory.features.cc[ccValue] = (userHistory.features.cc[ccValue] || 0) + 1;
+                    userHistory.total.cc = (userHistory.total.cc || 0) + 1; // 累加CC总次数
                 }
             }
 
@@ -663,29 +471,412 @@ class RiskEngine {
 
             // 新增：更新RTT特征
             if (features.rtt !== undefined) {
-                const rttValue = features.rtt;
-
-
-
+                // 格式化RTT值，确保存储格式一致
+                const rttValue = parseFloat(features.rtt).toFixed(3);
+                
                 // 更新用户历史
                 userHistory.features.rtt = userHistory.features.rtt || {};
                 userHistory.features.rtt[rttValue] = (userHistory.features.rtt[rttValue] || 0) + 1;
                 userHistory.total.rtt = (userHistory.total.rtt || 0) + 1;
+                
+                console.debug(`[用户历史] 更新RTT特征: ${rttValue}`);
             }
-
-
 
 
 
             console.debug(`[用户历史] 更新成功: ${userId}`, {
                 loginCount: userHistory.loginCount,
                 ipCount: Object.keys(userHistory.features.ip).length,
-                uaCount: Object.keys(userHistory.features.ua).length
+                uaCount: Object.keys(userHistory.features.ua).length,
+                asnCount: Object.keys(userHistory.features.asn).length, // 新增ASN计数
+                ccCount: Object.keys(userHistory.features.cc).length,   // 新增CC计数
+                bvCount: Object.keys(userHistory.features.bv).length,   // 新增BV计数
+                osvCount: Object.keys(userHistory.features.osv).length, // 新增OSV计数
+                dfCount: Object.keys(userHistory.features.df).length,   // 新增DF计数
+                rttCount: Object.keys(userHistory.features.rtt).length // 新增RTT计数
             });
         } catch (error) {
             console.error(`[用户历史] 更新失败: ${userId}`, error);
         }
     }
+
+    /**
+     * 计算子特征的条件概率 - 参考Python中的p_k方法
+     * @param {string} subFeature - 子特征名称
+     * @param {string} value - 子特征值
+     * @param {Object} userHistory - 用户历史记录
+     * @param {boolean} smoothing - 是否使用平滑处理
+     * @returns {number} - 条件概率
+     */
+    _calculateSubFeatureProbability(subFeature, value, userHistory, smoothing = true) {
+        // 获取子特征在历史中的出现次数
+        const subFeatureCount = userHistory.features[subFeature]?.[value] || 0;
+        const subFeatureTotal = userHistory.total[subFeature] || 0;
+
+        // 计算子特征的条件概率 p(x|k)
+        // 传入 subFeature 作为 featureType
+        const pXGivenK = this._calculateProbability(subFeatureCount, subFeatureTotal, smoothing, subFeature);
+
+        // 计算子特征的先验概率 p(k)
+        const pK = this._calculatePriorProbability(subFeature, userHistory, smoothing);
+
+        // 返回条件概率 p(x|k) * p(k)
+        return pXGivenK * pK;
+    }
+
+    /**
+     * 计算特征的概率 - 参考Python中的p方法
+     * @param {number} count - 特征值出现次数
+     * @param {number} total - 特征总出现次数
+     * @param {boolean} smoothing - 是否使用平滑处理
+     * @param {string} featureType - 特征类型，用于 _calculateUnseenFeatures
+     * @returns {number} - 概率值
+     */
+    _calculateProbability(count, total, smoothing = true, featureType = 'unknown') {
+        if (total === 0) return smoothing ? 0.5 : 0.0;
+
+        // 计算未见特征数量用于平滑处理
+        // 这里的 featureType 需要从外部传入，或者根据上下文推断
+        // 暂时假设 featureType 为 'unknown' 或不传，让 _calculateUnseenFeatures 内部处理
+        const unseenFeatures = this._calculateUnseenFeatures(total, smoothing, featureType);
+        return (count + unseenFeatures) / (total + unseenFeatures);
+    }
+
+    /**
+     * 计算特征的先验概率 - 简化版
+     * @param {string} feature - 特征名称
+     * @param {Object} history - 历史记录
+     * @param {boolean} smoothing - 是否使用平滑处理
+     * @returns {number} - 先验概率
+     */
+    _calculatePriorProbability(feature, history, smoothing = true) {
+        // 简化实现，返回该特征在历史中的占比
+        const featureTotal = history.total[feature] || 0;
+        const loginCount = history.loginCount || 1;
+
+        if (featureTotal > 0) {
+            return featureTotal / loginCount;
+        } else {
+            // 对于 rtt 特征，如果 total 为 0，则返回一个默认值，避免除以零
+            if (feature === 'rtt') {
+                return smoothing ? 0.01 : 0.0; // 假设 rtt 默认概率较低
+            }
+            return smoothing ? 0.5 : 0.0;
+        }
+    }
+
+    /**
+     * 计算未见特征数量 - 简化版M_hk方法
+     * @param {number} total - 特征总数
+     * @param {boolean} smoothing - 是否使用平滑处理
+     * @returns {number} - 未见特征估计数量
+     */
+    _calculateUnseenFeatures(total, smoothing, featureType) {
+        // 简化处理，直接返回一个基于总数的估计值
+        // 实际应用中，这里需要更复杂的统计模型来估计未见特征数量
+        // 例如，可以根据历史数据中不同特征值的增长趋势来预测
+        // 或者使用更高级的平滑技术，如Good-Turing估计
+
+        // 临时简化：如果 total 为 0，则未见特征为 1，否则为总数的某个比例
+        if (total === 0) {
+            return 1; // 至少有一个未见特征
+        }
+
+        // 可以根据 featureType 进行更细致的调整
+        let factor = config.unseenFeatureFactor; // 默认系数
+        if (featureType === 'rtt') {
+            factor = 0.05; // RTT可能变化较小，系数可以小一点
+        }
+
+        return Math.max(1, Math.floor(total * factor));
+    }
+
+    /**
+     * 计算用户风险评分（异步方法）
+     * @param {string} userId - 用户ID
+     * @param {Object} features - 登录特征对象
+     * @returns {Promise<Object>} 风险评估结果
+     */
+    async calculate(userId, features) {
+        // 配置项空值校验
+        if (!config.coefficients || typeof config.coefficients !== 'object' || Object.keys(config.coefficients).length === 0) {
+            throw new Error('风险系数配置异常: config.coefficients未正确定义');
+        }
+
+        console.debug(`[风险引擎] 开始计算用户 ${userId} 的风险评分，输入特征:`, JSON.stringify(features, null, 2));
+
+        // 新增动态系数遍历验证
+        console.debug('[风险引擎] 动态系数配置条目:', JSON.stringify(Object.entries(config.dynamicCoefficients), null, 2));
+
+        const { globalHistory, userHistory } = await this._getHistories(userId);
+        const p_L = 1 / (1 + Math.exp(-0.1 * userHistory.loginCount));
+
+        console.debug('[风险引擎] 获取历史数据完成', {
+            globalLoginCount: globalHistory.loginCount,
+            userLoginCount: userHistory.loginCount,
+            p_L: p_L
+        });
+
+        let riskScore = 0.0; // 初始分数为0，因为我们使用累加而不是连乘
+        const dynamicCoeffEntries = Object.entries(config.dynamicCoefficients);
+        const totalCoefficients = dynamicCoeffEntries.reduce((sum, [_, coeffConfig]) => sum + coeffConfig.coefficient, 0);
+
+        console.debug('[风险引擎] 开始遍历动态系数，总计:', dynamicCoeffEntries.length, '个', { totalCoefficients });
+
+        for (const [featureName, coeffConfig] of dynamicCoeffEntries) {
+            console.debug('[风险引擎] 处理特征:', featureName);
+
+            const featureValue = this._parseFeature(featureName, features);
+            console.debug('[特征解析]', { feature: featureName, value: featureValue });
+
+            // 获取正确的特征值用于查询历史记录
+            let lookupValue;
+            if (featureName === 'ip') {
+                lookupValue = featureValue.ip; // 使用IP地址字符串
+            } else if (featureName === 'ua') {
+                lookupValue = featureValue.ua; // 使用浏览器名称字符串
+            } else if (featureName === 'rtt') {
+                // 对RTT进行格式化，确保与历史记录中的格式一致
+                lookupValue = featureValue.toFixed(3);
+            } else {
+                lookupValue = featureValue;
+            }
+
+            const p_A = this._calcAttackerProbability(featureName, featureValue);
+            const userHistoryCount = userHistory.features[featureName]?.[lookupValue] || 0;
+            const p_x_L = this._smooth(userHistoryCount, userHistory.total[featureName]);
+            const p_x = this._calcGlobalProb(featureName, featureValue, globalHistory);
+
+            console.debug(`[风险引擎] 特征 ${featureName} 概率计算结果:`, {
+                p_A: p_A, // 攻击者概率
+                p_x_L: p_x_L, // 用户本地概率
+                p_x: p_x, // 全局概率
+                lookupValue: lookupValue, // 用于查询的特征值
+                userHistoryCount: userHistoryCount, // 用户历史中该特征值的出现次数
+                userHistoryTotal: userHistory.total[featureName] || 0, // 用户历史中该特征的总次数
+                globalHistoryCount: globalHistory.globalStats.featureStats[featureName]?.[lookupValue] || 0, // 全局历史中该特征值的出现次数
+                globalHistoryTotal: globalHistory.globalStats.totalStats[featureName] || 0 // 全局历史中该特征的总次数
+            });
+
+            // 使用贝叶斯公式计算特征风险: p(A|x) = (p(x|A) * p(A)) / (p(x|A) * p(A) + p(x|L) * p(L))
+            // 这里 p(x|A) 近似为 p_x，p(x|L) 近似为 p_x_L
+            let featureRisk;
+            if (p_x_L === 0 || p_x === 0) {
+                console.warn(`[风险引擎] p_x_L 或 p_x 为零，特征 ${featureName} 的风险分数计算使用备选方案。`);
+                // 当概率为0时，使用攻击者概率作为基础风险值
+                featureRisk = p_A;
+            } else {
+                featureRisk = (p_x * p_A) / (p_x * p_A + p_x_L * p_L);
+            }
+            
+            // 应用特征权重
+            const weightedRisk = featureRisk * coeffConfig.coefficient;
+            riskScore += weightedRisk; // 累加而不是相乘，避免连乘导致分数过小
+
+            console.debug(`[风险引擎] 特征 ${featureName} 风险计算:`, { 
+                featureRisk: featureRisk,
+                coefficient: coeffConfig.coefficient,
+                weightedRisk: weightedRisk,
+                currentRiskScore: riskScore
+            });
+        }
+
+        console.debug('[风险引擎] 所有特征计算完成', { rawScore: riskScore, totalCoefficients });
+
+        // 确保 riskScore 是一个有效数字，避免 NaN 传播
+        const safeRiskScore = isNaN(riskScore) ? 0 : riskScore;
+        
+        // 归一化风险分数，除以总系数权重
+        const normalizedScore = safeRiskScore / totalCoefficients;
+        
+        // 使用 Sigmoid 函数将分数映射到 [0, 1] 范围，并调整曲线形状
+        // 参数 k 控制曲线的陡峭程度，较大的 k 使中等风险更明显区分
+        const k = 4.0;
+        const finalScore = 1 / (1 + Math.exp(-k * (normalizedScore - 0.5)));
+        
+        console.debug('[风险引擎] 最终风险分数计算', { 
+            safeRiskScore, 
+            normalizedScore, 
+            finalScore 
+        });
+
+        const action = finalScore > config.risk.rejectThreshold ? 'REJECT' :
+                       finalScore > config.risk.requestThreshold ? 'CHALLENGE' : 'ALLOW';
+
+        console.debug('[风险引擎] 风险评估结果', { action: action });
+
+        return {
+            score: finalScore,
+            action: action
+        };
+    }
+
+    _calcAttackerProbability(feature, value) {
+        // 实现基于特征的概率计算逻辑（参考core.py的系数模型）
+        switch(feature) {
+            case 'ip':
+                return this._calcIPRisk(value);
+            case 'ua':
+                return this._calcUARisk(value);
+            case 'rtt':
+                // 使用更平滑的概率分布计算RTT风险
+                // RTT值越大，风险越高，使用sigmoid函数映射到[0.1, 0.9]范围
+                if (typeof value !== 'number') {
+                    console.warn('[风险引擎] RTT值不是数字:', value);
+                    return 0.5; // 默认中等风险
+                }
+                
+                // 对RTT进行归一化处理
+                // 假设正常RTT范围在0-500ms，超过1000ms视为高风险
+                const normalizedRTT = Math.min(value, 2000) / 1000; // 限制最大值为2000ms
+                
+                // 使用sigmoid函数将归一化RTT映射到[0.1, 0.9]范围
+                // 公式: 0.1 + 0.8 / (1 + Math.exp(-5 * (x - 0.5)))
+                // 其中x是归一化后的RTT值，5控制曲线陡峭程度，0.5是中点
+                const riskProb = 0.1 + 0.8 / (1 + Math.exp(-5 * (normalizedRTT - 0.5)));
+                
+                console.debug('[风险引擎] RTT风险计算:', { 
+                    rtt: value, 
+                    normalizedRTT, 
+                    riskProb 
+                });
+                
+                return riskProb;
+            default:{
+                return 0.5; // 默认中等风险
+            }
+        }
+    }
+
+    /**
+     * 计算IP风险概率
+     * @param {Object} ipData - IP数据对象 {ip, asn, cc}
+     * @returns {number} 风险概率
+     */
+    _calcIPRisk(ipData) {
+        if (!ipData) {
+            console.warn('[风险引擎] IP数据为空');
+            return 0.5; // 默认中等风险
+        }
+        
+        let riskLevel = 0.3; // 默认基础风险
+        let riskFactors = [];
+        
+        // 本地IP视为低风险
+        if (ipData.ip === '::1' || ipData.ip === '127.0.0.1' || ipData.ip.startsWith('192.168.') || ipData.ip.startsWith('10.')) {
+            riskLevel = 0.05;
+            riskFactors.push('本地IP');
+        }
+        // 高风险ASN
+        else if (this.maliciousNetworks && this.maliciousNetworks.includes(ipData.asn)) {
+            riskLevel = 0.8;
+            riskFactors.push('高风险ASN');
+        }
+        // 高风险国家
+        else if (config.maliciousCountries && config.maliciousCountries.includes(ipData.cc)) {
+            riskLevel = 0.7;
+            riskFactors.push('高风险国家');
+        }
+        // 未知ASN
+        else if (!ipData.asn || ipData.asn === 'Unknown') {
+            riskLevel = 0.5;
+            riskFactors.push('未知ASN');
+        }
+        // 未知国家
+        else if (!ipData.cc || ipData.cc === 'XX') {
+            riskLevel = 0.5;
+            riskFactors.push('未知国家');
+        }
+        
+        console.debug('[风险引擎] IP风险计算:', { 
+            ip: ipData.ip, 
+            asn: ipData.asn, 
+            cc: ipData.cc, 
+            riskLevel,
+            riskFactors
+        });
+        
+        return riskLevel;
+    }
+
+    /**
+     * 计算UA风险概率
+     * @param {Object} uaData - UA数据对象 {ua, bv, osv, df}
+     * @returns {number} 风险概率
+     */
+    _calcUARisk(uaData) {
+        if (!uaData) {
+            console.warn('[风险引擎] UA数据为空');
+            return 0.5; // 默认中等风险
+        }
+        
+        let riskLevel = 0.2; // 默认基础风险
+        let riskFactors = [];
+        
+        // 检查浏览器类型
+        const browserName = uaData.ua || 'Unknown';
+        const browserVersion = uaData.bv || '0.0.0';
+        const osVersion = uaData.osv || 'Unknown';
+        const deviceType = uaData.df || 'unknown';
+        
+        // 解析浏览器版本为数字
+        const versionNumber = parseInt(browserVersion.split('.')[0]) || 0;
+        
+        // 检查浏览器版本是否过低
+        const minVersion = config.minBrowserVersion[browserName] || 70;
+        
+        // 未知浏览器风险较高
+        if (browserName === 'Unknown') {
+            riskLevel = 0.7;
+            riskFactors.push('未知浏览器');
+        }
+        // 版本过低的浏览器风险较高
+        else if (versionNumber < minVersion) {
+            // 版本越低，风险越高
+            const versionGap = minVersion - versionNumber;
+            riskLevel = Math.min(0.9, 0.5 + versionGap * 0.05); // 最高风险0.9
+            riskFactors.push(`浏览器版本过低(${versionNumber}<${minVersion})`);
+        }
+        // 常见浏览器风险较低
+        else if (['Chrome', 'Firefox', 'Safari', 'Edge'].includes(browserName)) {
+            riskLevel = 0.1;
+            riskFactors.push('常见浏览器');
+        }
+        
+        // 设备类型风险调整
+        if (deviceType !== 'desktop' && deviceType !== 'unknown') {
+            // 移动设备略微增加风险
+            riskLevel += 0.1;
+            riskFactors.push('移动设备');
+        }
+        
+        // 未知操作系统版本略微增加风险
+        if (osVersion === 'Unknown') {
+            riskLevel += 0.1;
+            riskFactors.push('未知操作系统');
+        }
+        
+        // 确保风险值在[0.1, 0.9]范围内
+        riskLevel = Math.max(0.1, Math.min(0.9, riskLevel));
+        
+        console.debug('[风险引擎] UA风险计算:', { 
+            browser: browserName, 
+            version: browserVersion, 
+            os: osVersion, 
+            device: deviceType,
+            riskLevel,
+            riskFactors
+        });
+        
+        return riskLevel;
+    }
 }
 
 module.exports = RiskEngine;
+
+
+
+
+
+
+    
